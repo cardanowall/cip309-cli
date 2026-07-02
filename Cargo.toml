@@ -1,6 +1,6 @@
 [package]
 name = "cardanowall-cli"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["CardanoWall <hello@cardanowall.com>"]
@@ -26,7 +26,7 @@ path = "src/main.rs"
 # verification, sealed-PoE, merkle, and gateway-client logic lives there;
 # this CLI is a thin argument-parsing + output shell over it. The SDK is
 # published before the CLI; the version tracks the SDK crate's version.
-cardanowall = "0.7.1"
+cardanowall = "0.8.0"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 hex = "0.4.3"
