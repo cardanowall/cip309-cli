@@ -60,7 +60,9 @@ pub struct VerifyArgs {
     /// CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD).
     #[arg(long)]
     pub threshold: Option<String>,
-    /// Extra deny-list entries (repeatable; or env CARDANOWALL_DENY_HOST).
+    /// REPLACES the built-in egress deny list (repeatable; or env
+    /// CARDANOWALL_DENY_HOST): when set, only the hosts you list are refused —
+    /// you take over SSRF protection. Meant for loopback/dev gateways.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
     /// Recipient secret key for sealed PoE, as bare hex (repeatable; tried

@@ -1,0 +1,17 @@
+# Keep the build context lean and reproducible: only the crate source and its
+# committed lockfile need to reach the builder.
+
+# Compiled artifacts (the largest tree by far) are rebuilt inside the image.
+target/
+**/target/
+
+# Version-control metadata, CI configuration, and OS cruft are never build inputs.
+.git/
+.gitignore
+.github/
+.DS_Store
+**/.DS_Store
+
+# The container build consumes these on the host, not inside the context.
+Dockerfile
+.dockerignore

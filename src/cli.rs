@@ -126,6 +126,10 @@ pub enum Command {
     Verify(commands::verify::VerifyArgs),
     /// Anchor a Label 309 PoE on Cardano (hash / file / Merkle).
     Submit(commands::submit::SubmitArgs),
+    /// Anchor files, git commits, or digests as one PoE (CI-oriented).
+    Attest(commands::attest::AttestArgs),
+    /// Publish a sealed PoE: encrypt a file to recipients and anchor it.
+    Seal(commands::seal::SealArgs),
     /// Offline PATH-1 (identity Ed25519) record signing.
     Sign(commands::sign::SignArgs),
     /// Derive and print the public identity from a 32-byte master seed (offline).
@@ -148,6 +152,8 @@ impl Command {
         match self {
             Command::Verify(_) => "verify",
             Command::Submit(_) => "submit",
+            Command::Attest(_) => "attest",
+            Command::Seal(_) => "seal",
             Command::Sign(_) => "sign",
             Command::Identity(_) => "identity",
             Command::Merkle(_) => "merkle",
@@ -169,6 +175,8 @@ impl Command {
         match self {
             Command::Verify(a) => a.json,
             Command::Submit(a) => a.json,
+            Command::Attest(a) => a.json,
+            Command::Seal(a) => a.json,
             Command::Sign(a) => a.source_json(),
             Command::Identity(a) => a.json,
             Command::Merkle(a) => a.json_mode(),
@@ -236,6 +244,8 @@ where
     let result = match cli.command {
         Command::Verify(args) => commands::verify::run(args),
         Command::Submit(args) => commands::submit::run(args),
+        Command::Attest(args) => commands::attest::run(args),
+        Command::Seal(args) => commands::seal::run(args),
         Command::Sign(args) => commands::sign::run(args),
         Command::Identity(args) => commands::identity::run(args),
         Command::Merkle(args) => commands::merkle::run(args),

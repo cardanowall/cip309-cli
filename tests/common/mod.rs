@@ -6,6 +6,8 @@
 //! to the vectors the TypeScript and Python SDKs load.
 #![allow(dead_code)]
 
+pub mod stub_gateway;
+
 use std::path::{Path, PathBuf};
 
 /// Absolute path to the TypeScript SDK fixture tree (the verify-report goldens).

@@ -28,7 +28,7 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::secret::{resolve_secret_bytes, SecretEnv, SecretKind, SystemSecretEnv};
-use crate::util::{bytes_to_hex, hex_to_bytes, CliError};
+use crate::util::{bytes_to_hex, hex_to_bytes, is_all_hex, CliError};
 
 const ED25519_PUBKEY_BYTES: usize = 32;
 const ED25519_SIGNATURE_BYTES: usize = 64;
@@ -240,16 +240,6 @@ fn record_from_hash(hash_hex: &str, alg: HashAlg) -> Result<PoeRecord, CliError>
         }]),
         ..PoeRecord::default()
     })
-}
-
-fn is_all_hex(s: &str) -> bool {
-    let clean = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-        .unwrap_or(s);
-    !clean.is_empty()
-        && clean.len().is_multiple_of(2)
-        && clean.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Decode bytes as a Label 309 record. An all-hex string is hex-decoded first;

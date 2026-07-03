@@ -117,7 +117,7 @@ pub enum NetworkArg {
 
 impl NetworkArg {
     /// The network name recorded in the certificate anchor.
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             NetworkArg::Mainnet => "mainnet",
             NetworkArg::Preprod => "preprod",
@@ -128,7 +128,7 @@ impl NetworkArg {
     ///
     /// Cardanoscan exposes a transaction at `/transaction/<tx>` and AdaStat at
     /// `/transactions/<tx>`, each with a `preprod.` host prefix on preprod.
-    fn explorer_urls(self, tx_hash: &str) -> Vec<String> {
+    pub(crate) fn explorer_urls(self, tx_hash: &str) -> Vec<String> {
         let (cardanoscan, adastat) = match self {
             NetworkArg::Mainnet => ("https://cardanoscan.io", "https://adastat.net"),
             NetworkArg::Preprod => (
@@ -200,7 +200,9 @@ pub struct CertificateBuildArgs {
     /// Used only to auto-fetch the leaves-list with --tx.
     #[arg(long = "arweave-gateway")]
     pub arweave_gateway: Vec<String>,
-    /// Extra deny-list entries (repeatable; or env CARDANOWALL_DENY_HOST).
+    /// REPLACES the built-in egress deny list (repeatable; or env
+    /// CARDANOWALL_DENY_HOST): when set, only the hosts you list are refused —
+    /// you take over SSRF protection. Meant for loopback/dev gateways.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
     /// Write the JSON certificate here (default: stdout).

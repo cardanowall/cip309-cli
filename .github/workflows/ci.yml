@@ -24,18 +24,19 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
 
       # ---- Wait for the `cardanowall` SDK dependency on crates.io -------------
-      # The published Cargo.toml pins `cardanowall = "<version>"` from crates.io.
+      # The published Cargo.toml pins `cardanowall = "=<version>"` from crates.io.
       # On the coordinated-release sync commit, the SDK crate of the same version
       # is published by a parallel workflow (label-309-rs) and may not be in the
       # registry index yet, so the cargo resolution in the gates below would fail —
-      # the only window in which it can. Read the pinned version and poll the sparse
-      # index (the exact source cargo resolves against) until it appears, up to ~15
-      # minutes. On every normal push the version is already live, so the first poll
-      # succeeds and this is a no-op.
+      # the only window in which it can. Read the pinned version (the sed strips
+      # the exact-pin `=` prefix) and poll the sparse index (the exact source
+      # cargo resolves against) until it appears, up to ~15 minutes. On every
+      # normal push the version is already live, so the first poll succeeds and
+      # this is a no-op.
       - name: Wait for the `cardanowall` SDK on crates.io
         run: |
           set -euo pipefail
-          version=$(grep -E '^cardanowall = "' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          version=$(grep -E '^cardanowall = "' Cargo.toml | head -1 | sed -E 's/.*"=?([0-9][^"]*)".*/\1/')
           if [ -z "$version" ]; then echo "::error::could not read the cardanowall version from Cargo.toml"; exit 1; fi
           echo "CI needs cardanowall@$version from crates.io; polling the index..."
           for attempt in $(seq 1 90); do

@@ -9,6 +9,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-07-03
+
+### Added
+
+- `cardanowall attest` — one command that anchors a set of files (`--paths`, glob-expanded, byte-sorted, streamed hashing), a commit range (`--commits`, raw commit objects via git), or pre-hashed digests (`--leaf`) as a Label 309 record. One leaf publishes as a plain content-hash record; two or more publish as an RFC 9162 Merkle commitment with the leaves list on Arweave (`--publish full-tree`, the default) or as a root-only commitment (`--publish root`). Writes a deterministic `label-309-poe-manifest-v1` companion (`--anchor-manifest` appends its hash as the final leaf) and a `label-309-attest-receipt-v1` receipt, and emits per-leaf inclusion certificates after confirmation (`--certificates-dir`). Re-runs are safe by default: records are deterministic, so the gateway's content dedup replays the existing record without a second debit (an explicit `--idempotency-key` is also supported, with the strict same-body contract); waits for on-chain confirmation (`--wait confirmed`, exit code 3 on timeout with complete outputs); refuses to publish above a price cap (`--max-usd`, re-checked if the quote is refreshed); optional Ed25519 record signing with the existing seed flags.
+- `cardanowall seal` — publish a sealed PoE from the command line: the plaintext is hashed and encrypted locally (it is never uploaded in the clear), the ciphertext goes to Arweave, and the record carries one envelope slot per recipient. Recipients are age-style strings (`--to`, repeatable): classical x25519 and hybrid post-quantum X-Wing are auto-detected from the address form, one KEM per record — mixing refuses rather than downgrading. `--to-self` derives the sender's own slot from the seed (hybrid by default); `--sign` optionally signs the record, keeping encryption and authorship independent. Recipient capacity is pre-checked against the record-size ceiling with exact per-KEM limits, and sealed receipts use `label-309-seal-receipt-v1`.
+- `submit --record <file|->` — publish a pre-built canonical record byte-for-byte after local structural validation. This closes the air-gap loop (`sign prepare` → external signer → `sign assemble` → `submit --record`) and makes every record shape the standard allows publishable from the command line.
+- `submit`: `--hash` is repeatable (multi-item records), `--store` uploads the plaintext content and publishes it as a public attachment (`uris`), `--supersedes` (also on `attest`) links the record to the transaction it supersedes, and `--wait submitted|confirmed` with `--timeout` plus `--idempotency-key` complete the publish flow.
+
+### Fixed
+
+- Quote sizes are computed from the actual record — exact for content-hash records, a tight upper bound for Merkle records — instead of hardcoded constants that under-quoted signed Merkle records and made the gateway reject them at publish time.
+- Non-UTF-8 paths are refused with a clear error instead of being lossily collapsed; a glob can no longer drop such a file from the leaf set silently.
+
+### Changed
+
+- Tagged releases now attach prebuilt per-platform binaries with a `SHA256SUMS` manifest and publish a container image `ghcr.io/cardanowall/label-309-cli`. The `cardanowall` SDK dependency is pinned exactly to the coordinated release version.
+
 ## [0.8.0] - 2026-07-02
 
 ### Changed

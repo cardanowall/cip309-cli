@@ -21,7 +21,61 @@ the TypeScript and Python SDKs.
 
 ## Install
 
-### From source (today)
+### Prebuilt binaries
+
+Every tagged release attaches per-platform archives and a `SHA256SUMS`
+manifest to the
+[GitHub release](https://github.com/cardanowall/label-309-cli/releases):
+
+| Platform            | Target                       | Archive                                       |
+| ------------------- | ---------------------------- | --------------------------------------------- |
+| Linux x86_64        | `x86_64-unknown-linux-musl`  | `cardanowall-vX.Y.Z-<target>.tar.gz` (static) |
+| Linux ARM64         | `aarch64-unknown-linux-musl` | `cardanowall-vX.Y.Z-<target>.tar.gz` (static) |
+| macOS Apple Silicon | `aarch64-apple-darwin`       | `cardanowall-vX.Y.Z-<target>.tar.gz`          |
+| macOS Intel         | `x86_64-apple-darwin`        | `cardanowall-vX.Y.Z-<target>.tar.gz`          |
+| Windows x86_64      | `x86_64-pc-windows-msvc`     | `cardanowall-vX.Y.Z-<target>.zip`             |
+
+Download the archive for your platform, verify its checksum against
+`SHA256SUMS`, and put the binary on your `PATH`:
+
+```bash
+VERSION=X.Y.Z                  # the release you are installing
+TARGET=aarch64-apple-darwin    # your target from the table above
+BASE="https://github.com/cardanowall/label-309-cli/releases/download/v$VERSION"
+
+curl -fsSLO "$BASE/cardanowall-v$VERSION-$TARGET.tar.gz"
+curl -fsSLO "$BASE/SHA256SUMS"
+grep "cardanowall-v$VERSION-$TARGET.tar.gz" SHA256SUMS | sha256sum -c -   # macOS: shasum -a 256 -c -
+tar -xzf "cardanowall-v$VERSION-$TARGET.tar.gz"
+sudo install "cardanowall-v$VERSION-$TARGET/cardanowall" /usr/local/bin/
+```
+
+On Windows, download the `.zip`, verify it the same way, and unpack
+`cardanowall.exe` (`Expand-Archive` in PowerShell).
+
+### Container image
+
+Tagged releases also publish a multi-arch (amd64 + arm64) image to GHCR:
+
+```bash
+docker run --rm ghcr.io/cardanowall/label-309-cli:latest \
+  verify <tx-hash> --cardano-gateway https://api.koios.rest/api/v1
+
+# Persist gateway profiles and inbox cursors across runs:
+docker run --rm -v ~/.cardanowall:/home/cardanowall/.cardanowall \
+  ghcr.io/cardanowall/label-309-cli:latest gateway list
+```
+
+Images are tagged `X.Y.Z` per release; `latest` tracks the newest final
+release.
+
+### crates.io
+
+```bash
+cargo install cardanowall-cli   # installs the `cardanowall` binary
+```
+
+### From source
 
 ```bash
 # A release binary at target/release/cardanowall:
@@ -32,262 +86,68 @@ cargo install --path .
 cardanowall --version          # cardanowall <ver> (git <sha>, built <date>)
 ```
 
-Requires a recent stable Rust toolchain. No Node, no runtime, no network access
-to install.
-
-### Prebuilt binaries / crates.io
-
-Tagged releases publish the crate to crates.io and attach prebuilt
-per-platform binaries:
-
-```bash
-cargo install cardanowall-cli   # installs the `cardanowall` binary
-```
-
-Until the first tagged release, build from source as above.
+Requires a recent stable Rust toolchain (the build fetches crates.io
+dependencies). The resulting binary is fully self-contained — no Node, no
+runtime dependencies.
 
 ---
 
 ## Quick start
 
 ```bash
-# Inspect an identity derived from a 32-byte seed (offline, no network):
-printf '%s' "$SEED_HEX" | cardanowall identity --seed-stdin
+# Save your gateway once (endpoint + API key; see docs/GUIDE.md for keys):
+cardanowall gateway add prod --base-url https://cardanowall.com/api/v1
 
-# Verify a proof against a public Cardano explorer (no operator server):
+# Anchor a file's hash on Cardano (the bytes never leave your machine):
+cardanowall submit --file ./contract.pdf --wait confirmed
+
+# Anyone, anywhere verifies it with just the tx hash — no account, no trust:
 cardanowall verify <tx-hash> --cardano-gateway https://api.koios.rest/api/v1
-
-# Save a gateway once, then anchor a file's hash through it:
-cardanowall gateway add prod --base-url https://cardanowall.com/api/v1   # prompts for the key
-cardanowall submit --file ./contract.pdf --seed-stdin <<<"$SEED_HEX"
 ```
 
 ---
 
-## Commands
+## What it does
 
-Run `cardanowall <command> --help` for the full, authoritative flag list.
+Full task-oriented documentation with copy-pasteable examples for every
+capability lives in **[docs/GUIDE.md](docs/GUIDE.md)** — start there. Run
+`cardanowall <command> --help` for the authoritative flag list.
 
-### `verify <tx-hash>`
-
-Standalone verification of the Label 309 record at a Cardano transaction. Fetches
-the metadata from a public explorer, runs structural validation, checks record
-signatures, and (with a recipient key) decrypts and re-hashes a sealed payload.
-
-```bash
-cardanowall verify <tx-hash> \
-  --cardano-gateway https://api.koios.rest/api/v1 \   # repeatable; Koios-compatible
-  --blockfrost <project-id> \                          # optional fallback
-  --profile signed \                                   # core | signed | sealed | recipient-sealed
-  --json --pretty
-```
-
-Sealed proofs: pass `--secret-key <hex>` (or `--secret-key-file` / `--secret-key-stdin`,
-repeatable) to decrypt and recompute plaintext hashes. The keyring is global to
-the run — every supplied key is tried against every sealed item.
-`--no-fetch` suppresses content fetches (item URIs, sealed ciphertext, Merkle
-leaves-lists) — unfetched claims report as not checked. The transaction itself is
-still resolved from the Cardano gateway chain, so structural validation and
-signature checks run against the real on-chain record.
-
-### `submit`
-
-Anchor a new PoE through a gateway. Mutually exclusive modes:
-
-```bash
-cardanowall submit --hash <64-hex-digest>          # anchor a precomputed sha2-256 digest
-cardanowall submit --file ./doc.pdf                # hash the file, then anchor
-cardanowall submit --merkle ./leaves.txt           # build a Merkle tree, anchor root + leaves
-```
-
-Add `--seed` (or the safe variants below) to attach an Ed25519 record signature;
-omit it to publish unsigned. Requires a gateway (`--base-url` + `--api-key`, env,
-or a saved profile). `--alg blake2b-256` switches the content hash.
-
-### `sign record | prepare | assemble`
-
-Off-host PATH-1 (identity Ed25519) COSE signing — for air-gapped signing where the
-keys never touch the gateway.
-
-```bash
-cardanowall sign record  --seed-stdin --in record.cbor --json   # sign in one step
-cardanowall sign prepare --signer-pubkey <hex> --hash <hex>     # emit the sig-structure to sign elsewhere
-cardanowall sign assemble --signer-pubkey <hex> --signature <hex> --in record.cbor
-```
-
-### `identity --seed`
-
-Derive and print the public identity from a 32-byte master seed: Ed25519/X25519/
-X-Wing public keys, both age recipient strings, and a short display fingerprint.
-Fully offline; no network, no API key. `--json` emits the full X-Wing key.
-
-The seed is accepted in either representation, here and on every other command:
-64-digit raw hex (`0x` prefix and whitespace tolerated) or the checksummed
-`L309-SEED-1…` bech32 form in a single case (the lowercase twin is equally
-valid; mixed case is rejected).
-
-### `merkle build | verify`
-
-```bash
-cardanowall merkle build  --in leaves.txt --json            # root + canonical leaves-list
-cardanowall merkle verify --root <hex32> --leaf <hex32> --proof proof.json
-```
-
-### `inbox sync | list | decrypt`
-
-Discover, list, and decrypt sealed PoE addressed to your identity. Raw-seed-first:
-identify with `--seed` (hex or `L309-SEED-1…`) or a raw `--secret-key <hex>` (plus
-the `-file`/`-stdin` variants) — never an account envelope.
-
-```bash
-cardanowall inbox sync   --seed-stdin
-cardanowall inbox list   --seed-stdin --json
-cardanowall inbox decrypt <tx-hash> --secret-key-stdin
-```
-
-`sync` persists a per-identity cursor under `~/.cardanowall/<id>/inbox.json`.
-
-### `gateway add | use | list | show | remove`
-
-Named gateway profiles (an endpoint + its API key). This is configuration, not a
-login — the gateway API is key-based.
-
-```bash
-cardanowall gateway add prod --base-url https://cardanowall.com/api/v1   # hidden key prompt
-cardanowall gateway add prod --base-url https://cardanowall.com/api/v1 --api-key-stdin <<<"$KEY"  # for CI
-cardanowall gateway use prod
-cardanowall gateway list                 # keys masked
-cardanowall gateway show prod --reveal   # print the key
-```
-
-### `completion <bash|zsh|fish|powershell>`
-
-Print a shell completion script to stdout.
-
-```bash
-cardanowall completion zsh  > ~/.zfunc/_cardanowall
-cardanowall completion bash > /etc/bash_completion.d/cardanowall
-```
-
----
+| Command       | What it does                                                                                 |
+| ------------- | -------------------------------------------------------------------------------------------- |
+| `verify`      | Prove a record standalone against public explorers — no operator server, ever                |
+| `submit`      | Anchor hashes, files (optionally `--store` the bytes), Merkle roots, or pre-built records    |
+| `attest`      | Anchor a whole release / dataset / commit range as ONE record (CI-oriented; receipts, certs) |
+| `seal`        | Encrypt a file to recipients and anchor the proof — hash public, content recipient-only      |
+| `inbox`       | Discover, list, and decrypt sealed records addressed to your identity                        |
+| `identity`    | Generate a new identity (`--generate`) or inspect one: signing key + delivery addresses      |
+| `sign`        | Off-host / air-gapped record signing (`prepare` → external signer → `assemble`)              |
+| `merkle`      | Offline Merkle tooling: build roots and leaves-lists, verify inclusion proofs                |
+| `certificate` | Build and offline-verify per-item inclusion certificates                                     |
+| `gateway`     | Named gateway profiles (endpoint + API key), stored `0600`                                   |
+| `completion`  | Shell completion scripts (bash / zsh / fish / powershell)                                    |
 
 ## Secrets & safety
 
-Secrets are **never required as a command-line argument** — argv leaks into shell
-history, `ps`, and CI logs. A seed or recipient key must come from **exactly one**
-source; supplying it from more than one is a hard error (so a stale `--seed-file`
-can never silently shadow an explicit `--seed`). With a single source, each
-command resolves it in this order:
-
-1. `--seed-file <path>` / `--secret-key-file <path>` (read from a file)
-2. `--seed-stdin` / `--secret-key-stdin` (or the value `-`) — read from stdin
-3. the raw `--seed <value>` / `--secret-key <hex>` flag — the **insecure** path
-   (see below); using it prints a one-line stderr warning
-4. the matching environment variable (see below)
-5. a **hidden interactive prompt** — only on a TTY, when the secret is required
-6. otherwise, a clear error pointing at options 1–4
-
-If two or more of these are present at once (for example `--seed-file` plus
-`CARDANOWALL_SEED`), the command fails with a CLI input error naming the
-conflicting sources and asking you to keep exactly one.
-
-On every path `--seed` accepts both seed representations — 64-digit raw hex or
-the checksummed `L309-SEED-1…` form; `--secret-key` is a raw X25519 key and is
-hex-only.
-
-The raw `--seed <value>` / `--secret-key <hex>` flags still exist for throwaway/
-test values (e.g. inspecting a public test vector with `identity`) but are
-documented as **insecure**, emit a stderr warning when used, and should not
-carry a real key. Errors that reject a malformed seed or key report only its
-length (and, for a bad hex digit, the offset) — never the value itself, so a
-mistyped secret never lands in your terminal scrollback or CI logs.
-
-The moderately-sensitive API key may be stored in a gateway profile; that file is
-written with `0600` permissions and the key is masked in `list`/`show`.
-
----
-
-## Configuration & precedence
-
-Config lives at `~/.cardanowall/config.toml` (override with `CARDANOWALL_CONFIG_PATH`),
-written `0600`:
-
-```toml
-default_gateway = "prod"
-
-[gateways.prod]
-base_url = "https://cardanowall.com/api/v1"   # full base, version segment included
-api_key  = "…"                                # stored only if you saved one
-
-# Public data sources used by `verify` / `inbox` (each string or list):
-cardano_gateway = ["https://api.koios.rest/api/v1"]
-arweave_gateway = "https://arweave.net"
-ipfs_gateway    = "https://ipfs.io"
-```
-
-Resolution precedence depends on which value it is:
-
-- **Service gateway** (`--base-url` / `--api-key`): **explicit flag → environment
-  variable → active gateway profile**. There is no built-in default — a service
-  endpoint must be supplied from one of these. The base URL is the **full** base
-  including the API version segment (e.g. `https://cardanowall.com/api/v1`); the
-  CLI appends only the resource path to it, so a future gateway version is reached
-  simply by configuring `…/api/v2`.
-- **Public data sources** (`--cardano-gateway` / `--arweave-gateway` /
-  `--ipfs-gateway` / `--blockfrost` / `--threshold` / `--deny-host`): **explicit
-  flag → environment variable → config-file top-level key → built-in default**.
-  These read the top-level `config.toml` keys shown above (not a named gateway
-  profile); the built-in default chain applies only when nothing else resolves.
-
-In every chain the first non-empty source wins; lower-precedence sources are not
-merged in.
-
----
-
-## Environment variables
-
-Consistent across every command:
-
-| Variable                                   | Flag                | Meaning                          |
-| ------------------------------------------ | ------------------- | -------------------------------- |
-| `CARDANOWALL_BASE_URL`                     | `--base-url`        | service gateway base URL         |
-| `CARDANOWALL_API_KEY`                      | `--api-key`         | opaque bearer API key            |
-| `CARDANOWALL_SEED`                         | `--seed`            | seed (hex or `L309-SEED-1…`)     |
-| `CARDANOWALL_RECIPIENT_KEY`                | `--secret-key`      | X25519 recipient key(s)          |
-| `CARDANOWALL_CARDANO_GATEWAY`              | `--cardano-gateway` | Koios-compatible explorer URL(s) |
-| `CARDANOWALL_ARWEAVE_GATEWAY`              | `--arweave-gateway` | Arweave gateway URL(s)           |
-| `CARDANOWALL_IPFS_GATEWAY`                 | `--ipfs-gateway`    | IPFS gateway URL(s)              |
-| `CARDANOWALL_BLOCKFROST_PROJECT_ID`        | `--blockfrost`      | Blockfrost fallback              |
-| `CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD` | `--threshold`       | confirmation depth               |
-| `CARDANOWALL_DENY_HOST`                    | `--deny-host`       | extra egress deny-list entries   |
-| `CARDANOWALL_CONFIG_PATH`                  | —                   | override the config file path    |
-
----
-
-## Automation & JSON
-
-- `--json` on any command emits machine-readable JSON on **stdout** (add `--pretty`
-  to indent). Data goes to stdout; diagnostics go to stderr — pipe-clean.
-- In `--json` mode, failures emit a structured error to **stderr**:
-  `{"error":{"code":<exit>,"message":"…","command":"…"}}`.
-- `--no-color` / `--color <auto|always|never>` and `-q/--quiet` are global. Color
-  follows `NO_COLOR` / `CLICOLOR_FORCE` / TTY detection and is never emitted under
-  `--json`.
-- Provide secrets via env or stdin in CI; never on argv.
+Secrets are never required on the command line. Seeds and keys arrive via
+`*-file` / `*-stdin` flags, environment variables, or a hidden TTY prompt —
+exactly one source at a time, with conflicts rejected loudly and error
+messages that never echo the value. The full precedence rules are in
+[docs/GUIDE.md §10.3](docs/GUIDE.md#103-secrets-sources-and-precedence).
 
 ## Exit codes
 
-| Code | Meaning                                                           |
-| ---- | ----------------------------------------------------------------- |
-| `0`  | valid / success                                                   |
-| `1`  | integrity-class failure (a cryptographic/structural check failed) |
-| `2`  | network-class failure (a fetch/transport error)                   |
-| `3`  | pending (insufficient confirmations)                              |
-| `4`  | CLI input error (bad arguments, missing required input)           |
+| Code | Meaning                                                            |
+| ---- | ------------------------------------------------------------------ |
+| `0`  | valid / success                                                    |
+| `1`  | integrity-class failure (a cryptographic/structural check failed)  |
+| `2`  | network-class failure (a fetch/transport error)                    |
+| `3`  | pending (insufficient confirmations, or a `--wait` that timed out) |
+| `4`  | CLI input error (bad arguments, missing required input)            |
 
-`verify` maps the verifier's verdict straight through to `0/1/2/3`.
-
----
+`verify` maps the verifier's verdict straight through to `0/1/2/3`; on the
+anchoring commands `1` also covers gateway rejections and the `--max-usd`
+refusal. Details per command in [docs/GUIDE.md §10.1](docs/GUIDE.md#101-exit-codes).
 
 ## Service independence
 

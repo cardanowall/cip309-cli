@@ -411,7 +411,8 @@ pub struct InboxListArgs {
     /// Blockfrost project id (enables Blockfrost fallback).
     #[arg(long)]
     pub blockfrost: Option<String>,
-    /// extra deny-list entries (repeatable).
+    /// replaces the built-in egress deny list (repeatable): the listed hosts
+    /// become the only refused ones — you take over SSRF protection.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
     /// The identity source (seed or X25519 secret key; raw / file / stdin / env).
@@ -614,7 +615,8 @@ pub struct InboxDecryptArgs {
     /// IPFS gateway URL (repeatable).
     #[arg(long = "ipfs-gateway")]
     pub ipfs_gateway: Vec<String>,
-    /// extra deny-list entries (repeatable).
+    /// replaces the built-in egress deny list (repeatable): the listed hosts
+    /// become the only refused ones — you take over SSRF protection.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
     /// The identity source (seed or X25519 secret key; raw / file / stdin / env).

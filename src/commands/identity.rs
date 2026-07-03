@@ -1,7 +1,10 @@
-//! `cardanowall identity --seed <hex>` — offline identity inspector.
+//! `cardanowall identity` — offline identity inspector and generator.
 //!
-//! Derives the full key set from the 32-byte master identity seed and prints the
-//! public keys, both age recipient strings, and a short display fingerprint.
+//! With a seed, derives the full key set from the 32-byte master identity seed
+//! and prints the public keys, both age recipient strings, and a short display
+//! fingerprint. With `--generate`, mints a NEW random seed from the OS CSPRNG
+//! and prints it once alongside the identity it derives — the seed is the
+//! identity; whoever holds it controls it, and it cannot be recovered.
 //! Performs ZERO chain / storage / API interaction; it never needs an API key.
 //!
 //! The fingerprint is a deterministic short tag for an identity: the first
@@ -19,6 +22,7 @@ use cardanowall::recipient::{encode_age_x25519_recipient, encode_age_xwing_recip
 use cardanowall::seed_derive::{
     derive_ed25519_keypair, derive_mlkem768x25519_keypair, derive_x25519_keypair,
 };
+use cardanowall::seed_encoding::encode_identity_seed;
 use clap::Args;
 use serde::Serialize;
 use zeroize::{Zeroize, Zeroizing};
@@ -36,6 +40,11 @@ const XWING_HEX_ABBREV_HEAD: usize = 16;
 /// value.
 #[derive(Args)]
 pub struct IdentityArgs {
+    /// generate a NEW random 32-byte seed from the OS entropy source and print
+    /// it ONCE together with the identity it derives. Store it immediately —
+    /// it cannot be recovered, and whoever holds it controls the identity.
+    #[arg(long)]
+    pub generate: bool,
     /// 32-byte master identity seed: 64-digit hex or the checksummed
     /// L309-SEED-1... form. INSECURE on argv (shell history / ps / CI logs);
     /// prefer --seed-file / --seed-stdin / CARDANOWALL_SEED / the prompt.
@@ -55,6 +64,7 @@ pub struct IdentityArgs {
 impl std::fmt::Debug for IdentityArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IdentityArgs")
+            .field("generate", &self.generate)
             .field("seed", &self.seed.as_ref().map(|_| "[redacted]"))
             .field("seed_file", &self.seed_file)
             .field("seed_stdin", &self.seed_stdin)
@@ -73,6 +83,17 @@ impl IdentityArgs {
     }
 }
 
+/// The freshly generated seed, in both accepted representations. Present in
+/// the outcome ONLY under `--generate` — the seed is deliberately printed
+/// exactly once, at mint time.
+#[derive(Debug, Serialize)]
+pub struct GeneratedSeed {
+    /// The checksummed portable form (`L309-SEED-1…`).
+    pub l309: String,
+    /// The raw 64-digit hex form.
+    pub hex: String,
+}
+
 /// The derived public identity, serialised to the JSON contract shape.
 #[derive(Debug, Serialize)]
 pub struct IdentityOutcome {
@@ -88,6 +109,10 @@ pub struct IdentityOutcome {
     pub age_recipient: String,
     /// The `age1pqc…` X-Wing recipient string.
     pub age1pqc_recipient: String,
+    /// The newly minted seed (only under `--generate`; never echoed for a
+    /// supplied seed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<GeneratedSeed>,
 }
 
 /// The 8-byte `sha2-256(ed25519_pub)` fingerprint, grouped `xxxx-xxxx-xxxx-xxxx`.
@@ -134,7 +159,29 @@ pub fn build_identity_outcome(seed: &[u8]) -> Result<IdentityOutcome, CliError> 
         xwing_pubkey_hex: bytes_to_hex(&xwing.public_key),
         age_recipient,
         age1pqc_recipient,
+        seed: None,
     })
+}
+
+/// Mint a fresh 32-byte seed from the OS CSPRNG and derive its identity.
+/// The outcome carries the seed in both representations — printed once,
+/// never persisted by the CLI.
+///
+/// # Errors
+///
+/// Returns [`CliError`] (exit `2`) if the OS entropy source fails.
+pub fn generate_identity_outcome() -> Result<IdentityOutcome, CliError> {
+    let mut seed = Zeroizing::new([0u8; 32]);
+    getrandom::fill(seed.as_mut())
+        .map_err(|e| CliError::network(format!("identity: the OS entropy source failed: {e}")))?;
+    let mut outcome = build_identity_outcome(seed.as_ref())?;
+    let l309 = encode_identity_seed(seed.as_ref())
+        .map_err(|e| CliError::input(format!("identity: {e}")))?;
+    outcome.seed = Some(GeneratedSeed {
+        l309,
+        hex: bytes_to_hex(seed.as_ref()),
+    });
+    Ok(outcome)
 }
 
 /// Resolve and length-check the master seed through the shared secret layer
@@ -176,6 +223,15 @@ fn emit(outcome: &IdentityOutcome, json: bool) {
     );
     println!("age:           {}", outcome.age_recipient);
     println!("age1pqc:       {}", outcome.age1pqc_recipient);
+    if let Some(seed) = &outcome.seed {
+        println!("seed (L309):   {}", seed.l309);
+        println!("seed (hex):    {}", seed.hex);
+        eprintln!(
+            "identity: NEW seed generated — store the seed line NOW (a password manager or an \
+             offline backup). It cannot be recovered, and whoever holds it controls this \
+             identity."
+        );
+    }
 }
 
 /// Run the `identity` command.
@@ -184,6 +240,17 @@ fn emit(outcome: &IdentityOutcome, json: bool) {
 ///
 /// Returns [`CliError`] (exit `4`) for a missing, malformed, or wrong-length seed.
 pub fn run(args: IdentityArgs) -> Result<(), CliError> {
+    if args.generate {
+        if args.secret_args().any_present() {
+            return Err(CliError::input(
+                "identity: --generate mints a fresh seed and cannot be combined with a seed \
+                 source (--seed / --seed-file / --seed-stdin)",
+            ));
+        }
+        let outcome = generate_identity_outcome()?;
+        emit(&outcome, args.json);
+        return Ok(());
+    }
     let seed = resolve_seed(&args, &SystemSecretEnv)?;
     let outcome = build_identity_outcome(&seed)?;
     emit(&outcome, args.json);
@@ -197,6 +264,7 @@ mod tests {
 
     fn args_with_seed(seed: Option<&str>) -> IdentityArgs {
         IdentityArgs {
+            generate: false,
             seed: seed.map(str::to_string),
             seed_file: None,
             seed_stdin: false,
@@ -250,6 +318,40 @@ mod tests {
         // xxxx-xxxx-xxxx-xxxx → 16 hex + 3 dashes.
         assert_eq!(outcome.fingerprint.len(), 19);
         assert_eq!(outcome.fingerprint.matches('-').count(), 3);
+    }
+
+    #[test]
+    fn generate_mints_a_valid_seed_that_round_trips() {
+        let outcome = generate_identity_outcome().unwrap();
+        let generated = outcome.seed.as_ref().expect("--generate carries the seed");
+        // Both representations decode back to the same 32 bytes, and the
+        // printed identity is exactly the one that seed derives.
+        let bytes = cardanowall::seed_encoding::parse_identity_seed(&generated.l309).unwrap();
+        assert_eq!(bytes_to_hex(&bytes), generated.hex);
+        let rederived = build_identity_outcome(&bytes).unwrap();
+        assert_eq!(rederived.fingerprint, outcome.fingerprint);
+        assert_eq!(rederived.age_recipient, outcome.age_recipient);
+        assert_eq!(rederived.age1pqc_recipient, outcome.age1pqc_recipient);
+        // Two mints never collide.
+        let second = generate_identity_outcome().unwrap();
+        assert_ne!(second.seed.unwrap().hex, generated.hex);
+    }
+
+    #[test]
+    fn generate_conflicts_with_any_seed_source() {
+        let mut args = args_with_seed(Some(&"ab".repeat(32)));
+        args.generate = true;
+        assert_eq!(run(args).unwrap_err().code, 4);
+    }
+
+    #[test]
+    fn a_supplied_seed_is_never_echoed_back() {
+        // The seed field exists ONLY for --generate; deriving from a supplied
+        // seed must not reprint it on any output surface.
+        let outcome = build_identity_outcome(&[7u8; 32]).unwrap();
+        assert!(outcome.seed.is_none());
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(!json.contains("seed"));
     }
 
     #[test]

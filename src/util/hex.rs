@@ -19,6 +19,20 @@ pub fn bytes_to_hex(bytes: &[u8]) -> String {
     cardanowall::hex::encode(bytes)
 }
 
+/// Whether a string is entirely hex (after an optional `0x`/`0X` prefix) with
+/// an even length — the discriminator for inputs that accept either a hex
+/// TEXT encoding or raw CBOR bytes.
+#[must_use]
+pub fn is_all_hex(s: &str) -> bool {
+    let clean = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
+    !clean.is_empty()
+        && clean.len().is_multiple_of(2)
+        && clean.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Decode a lenient hex string: an optional `0x`/`0X` prefix, either case.
 ///
 /// # Errors

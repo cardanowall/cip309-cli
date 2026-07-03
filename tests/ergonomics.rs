@@ -338,3 +338,46 @@ fn piped(content: &str) -> std::process::Stdio {
     f.seek(SeekFrom::Start(0)).unwrap();
     std::process::Stdio::from(f)
 }
+
+#[test]
+fn identity_generate_mints_a_usable_seed_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = cmd(&config, &home)
+        .args(["identity", "--generate", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "identity --generate failed: {out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let l309 = v["seed"]["l309"].as_str().unwrap();
+    let hex = v["seed"]["hex"].as_str().unwrap();
+    assert!(l309.starts_with("L309-SEED-1"));
+    assert_eq!(hex.len(), 64);
+    assert!(v["age_recipient"].as_str().unwrap().starts_with("age1"));
+    assert!(v["age1pqc_recipient"]
+        .as_str()
+        .unwrap()
+        .starts_with("age1pqc1"));
+
+    // The minted seed round-trips: feeding it back derives the SAME identity.
+    let back = cmd(&config, &home)
+        .args(["identity", "--json"])
+        .env("CARDANOWALL_SEED", l309)
+        .output()
+        .unwrap();
+    assert!(back.status.success());
+    let b: serde_json::Value = serde_json::from_slice(&back.stdout).unwrap();
+    assert_eq!(b["fingerprint"], v["fingerprint"]);
+    assert_eq!(b["age1pqc_recipient"], v["age1pqc_recipient"]);
+    // A supplied seed is never echoed back.
+    assert!(b.get("seed").is_none());
+
+    // --generate refuses to combine with a seed source.
+    let conflict = cmd(&config, &home)
+        .args(["identity", "--generate", "--seed", &"ab".repeat(32)])
+        .output()
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(4));
+}

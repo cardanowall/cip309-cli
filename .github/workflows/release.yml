@@ -18,9 +18,13 @@ name: release
 #      CARGO_REGISTRY_TOKEN secret; the crates-io-auth-action step below mints a
 #      short-lived token from this job's OIDC identity instead.
 #
-# This crate depends on the `cardanowall` SDK crate (label-309-rs). Publish the SDK to
-# crates.io BEFORE tagging a CLI release, or the publish step will fail because the
-# SDK dependency cannot resolve from the registry.
+# This crate depends on the `cardanowall` SDK crate (label-309-rs). The two
+# release in lockstep from tags pushed at the same moment, so the publish job
+# polls the crates.io index until the SDK version matching this tag is live
+# before gating and publishing. Everything downstream of publish — the prebuilt
+# binaries, the GitHub Release, the GHCR image — compiles against that
+# published SDK, which is why those jobs run only on a real version tag and
+# never on a workflow_dispatch dry-run.
 
 on:
   push:
@@ -30,7 +34,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry-run (cargo publish --dry-run --allow-dirty; keep the path-dep, skip the real publish + Release)'
+        description: 'Dry-run (cargo publish --dry-run; skip the real publish — binaries, Release, and image are tag-only)'
         required: false
         default: 'false'
 
@@ -39,21 +43,56 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  # id-token is required for crates.io Trusted-Publisher OIDC.
-  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  # The `secrets` context cannot be referenced from an `if:` condition, so the
-  # optional bootstrap token is surfaced as env (empty unless the secret is set).
-  BOOTSTRAP_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
 jobs:
-  release:
+  # ---- Gates + crates.io publish --------------------------------------------
+  publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # id-token is required for crates.io Trusted-Publisher OIDC.
+      id-token: write
+    env:
+      # The `secrets` context cannot be referenced from an `if:` condition, so the
+      # optional bootstrap token is surfaced as env (empty unless the secret is set).
+      BOOTSTRAP_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@v6
+
+      # Fail before any toolchain work if the pushed tag disagrees with the
+      # crate manifest: a mistagged commit must never publish, and every
+      # downstream asset stamps this version into its file name.
+      - name: Assert the tag matches the crate version
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$tag_version" != "$crate_version" ]; then
+            echo "::error::tag v$tag_version does not match the Cargo.toml package version $crate_version"
+            exit 1
+          fi
+          echo "tag v$tag_version matches Cargo.toml"
+
+      - name: Derive release metadata
+        id: meta
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -61,7 +100,7 @@ jobs:
       # ---- Wait for the SDK crate to be live on crates.io ----------------------
       # In the coordinated release, label-309-rs publishes `cardanowall` and this
       # repo publishes `cardanowall-cli` from tags pushed at the same moment, so
-      # the two release workflows race. This crate pins `cardanowall = "<version>"`
+      # the two release workflows race. This crate pins `cardanowall = "=<version>"`
       # from crates.io, so BOTH the gate build below and the publish step need the
       # SDK already in the registry index. Poll the sparse index — the exact source
       # cargo resolves against — until the matching version appears (up to ~15
@@ -69,7 +108,7 @@ jobs:
       # compile. Tag-push only: a workflow_dispatch dry-run carries no release
       # version and skips this.
       - name: Wait for `cardanowall` SDK on crates.io
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
@@ -87,6 +126,35 @@ jobs:
           echo "::error::cardanowall@$version did not reach crates.io within ~15 min - label-309-rs may still be running or failed; re-run this workflow once the SDK is published."
           exit 1
 
+      # ---- Reconcile the lockfile with the published SDK -----------------------
+      # The SDK releases in lockstep with this CLI, so a freshly tagged tree can
+      # carry a Cargo.lock whose `cardanowall` entry does not satisfy the exact
+      # registry pin in Cargo.toml — either it still lacks its registry source +
+      # checksum (those exist only once the SDK is published), or it is a stale
+      # registry entry for an older SDK version. In exactly those cases run
+      # cargo's conservative resolve (`cargo fetch`): it keeps every locked
+      # version and only re-resolves the SDK entry. (`cargo update -p` would be
+      # wrong twice over: it errors on the orphaned path entry, and it
+      # re-unifies wide-ranged transitive deps into a graph the committed lock
+      # never tested.) A lock that already satisfies the pin — registry source
+      # AND matching version — is used byte-for-byte as committed.
+      - name: Reconcile Cargo.lock with the published SDK
+        run: |
+          set -euo pipefail
+          pin=$(grep -E '^cardanowall = "=' Cargo.toml | head -1 | sed -E 's/.*"=([^"]+)".*/\1/')
+          if [ -z "$pin" ]; then
+            echo "::error::could not read the exact cardanowall pin from Cargo.toml"
+            exit 1
+          fi
+          entry=$(grep -A 2 '^name = "cardanowall"$' Cargo.lock || true)
+          lock_version=$(printf '%s\n' "$entry" | grep '^version = ' | head -1 | sed -E 's/version = "([^"]+)"/\1/' || true)
+          if printf '%s\n' "$entry" | grep -q '^source = "registry+' && [ "$lock_version" = "$pin" ]; then
+            echo "Cargo.lock already resolves cardanowall $pin from crates.io; leaving it untouched."
+          else
+            echo "Cargo.lock entry (version ${lock_version:-none}) does not satisfy the =$pin registry pin; reconciling."
+            cargo fetch
+          fi
+
       # ---- Gates: the standalone CI suite, re-run as release-blockers ----------
       - name: Format check
         run: cargo fmt --check
@@ -96,31 +164,6 @@ jobs:
 
       - name: Test (full suite)
         run: cargo test --all-features
-
-      # ---- Rewrite the SDK dependency to a crates.io version (real publish only)
-      # The committed Cargo.toml carries a local path-dep on the `cardanowall` SDK
-      # crate so the repo builds + tests on its own. crates.io requires a registry
-      # version dep instead, so on a real tag publish we strip the `path = "..."`
-      # key, leaving the `version` requirement cargo already records alongside it.
-      # On a dry-run we leave the path-dep in place and pass --allow-dirty.
-      - name: Rewrite SDK dep to a crates.io version (skip on dry-run)
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run == 'true') }}
-        run: |
-          set -euo pipefail
-          # Drop a `path = "..."` (and any `, path = "..."`) from the cardanowall
-          # dependency line so only the registry `version` requirement remains.
-          python3 - <<'PY'
-          import re, pathlib
-          p = pathlib.Path("Cargo.toml")
-          t = p.read_text()
-          # Remove path = "..." within the cardanowall dependency table entry.
-          t2 = re.sub(r'(cardanowall\s*=\s*\{[^}]*?),?\s*path\s*=\s*"[^"]*"', r'\1', t)
-          if 'version' not in t2.split('cardanowall =', 1)[1].split('}', 1)[0]:
-              raise SystemExit("cardanowall dependency has no version requirement; cannot publish to crates.io")
-          p.write_text(t2)
-          print("Rewrote cardanowall dependency to a crates.io version dep:")
-          print([l for l in t2.splitlines() if l.strip().startswith("cardanowall")])
-          PY
 
       # ---- Publish to crates.io (OIDC trusted-publishing; token bootstrap) ------
       # Mint a short-lived (30-minute) registry token from this job's OIDC
@@ -142,35 +185,216 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
-            # Path-dep to the (possibly unpublished) SDK is kept; --allow-dirty lets
-            # cargo package the working tree without a clean-VCS requirement.
+            # A dispatch dry-run resolves the SDK pin from the registry like any
+            # other build, so run it only when the pinned version is already
+            # live on crates.io.
             echo "Dry-run: cargo publish --dry-run --allow-dirty"
             cargo publish --dry-run --allow-dirty
           else
-            # The exported Cargo.lock pins `cardanowall` from the monorepo path
-            # dep; publishing re-resolves it to the crates.io entry, rewriting the
-            # lock and dirtying the tree. --allow-dirty permits that expected
-            # lockfile update — cargo still runs the full verify build.
+            # The lock reconcile above may have rewritten Cargo.lock, dirtying
+            # the fresh checkout. --allow-dirty permits exactly that expected
+            # update — cargo still runs the full verify build.
             cargo publish --allow-dirty
           fi
 
-      # ---- GitHub Release ------------------------------------------------------
-      - name: Detect pre-release tag
-        id: prerelease
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+      - name: Notice — binaries, Release, and image are tag-only
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
-          if [[ "${{ github.ref_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-.+$ ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          echo "::notice::workflow_dispatch stops after the publish job. The prebuilt binaries, the GitHub Release, and the GHCR image all compile against the published cardanowall SDK at this exact version, which a dry-run of an unpublished version cannot fetch from crates.io; they run only on a real version-tag push."
+
+  # ---- Prebuilt binaries (native runners — no cross-compilation, no QEMU) ----
+  build-binaries:
+    name: Binary (${{ matrix.target }})
+    needs: publish
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux binaries are musl-static: one self-contained binary per
+          # architecture that runs on any distro, glibc or not.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          # macos-15-intel is GitHub's current Intel runner line (macos-13 and
+          # the plain macos-14/15 Intel labels are retired).
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install stable toolchain + target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: ${{ contains(matrix.target, '-musl') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+
+      # Same lockstep window (and the same gate) as the publish job: only touch
+      # the lock when its SDK entry does not satisfy the exact registry pin
+      # (missing registry source, or a stale registry entry at another
+      # version), and then only via cargo's conservative resolve. The SDK is
+      # live by now — the publish job waited for it.
+      - name: Reconcile Cargo.lock with the published SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin=$(grep -E '^cardanowall = "=' Cargo.toml | head -1 | sed -E 's/.*"=([^"]+)".*/\1/')
+          if [ -z "$pin" ]; then
+            echo "::error::could not read the exact cardanowall pin from Cargo.toml"
+            exit 1
+          fi
+          entry=$(grep -A 2 '^name = "cardanowall"$' Cargo.lock || true)
+          lock_version=$(printf '%s\n' "$entry" | grep '^version = ' | head -1 | sed -E 's/version = "([^"]+)"/\1/' || true)
+          if printf '%s\n' "$entry" | grep -q '^source = "registry+' && [ "$lock_version" = "$pin" ]; then
+            echo "Cargo.lock already resolves cardanowall $pin from crates.io; leaving it untouched."
           else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "Cargo.lock entry (version ${lock_version:-none}) does not satisfy the =$pin registry pin; reconciling."
+            cargo fetch
           fi
 
+      - name: Build (${{ matrix.target }})
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # cardanowall-v<version>-<target>.tar.gz (unix) / .zip (windows), each
+      # containing a directory of the same name with the binary + LICENSE +
+      # README. The version comes from the tag, already asserted equal to the
+      # crate version by the publish job.
+      - name: Package archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.publish.outputs.version }}"
+          target="${{ matrix.target }}"
+          stage="cardanowall-v$version-$target"
+          mkdir "$stage"
+          if [[ "$target" == *windows* ]]; then
+            bin="cardanowall.exe"
+          else
+            bin="cardanowall"
+          fi
+          cp "target/$target/release/$bin" LICENSE README.md "$stage/"
+          if [[ "$target" == *windows* ]]; then
+            archive="$stage.zip"
+            7z a "$archive" "$stage"
+          else
+            archive="$stage.tar.gz"
+            tar -czf "$archive" "$stage"
+          fi
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cardanowall-${{ matrix.target }}
+          path: ${{ steps.archive.outputs.archive }}
+          if-no-files-found: error
+
+  # ---- GitHub Release: archives + SHA256SUMS ---------------------------------
+  release:
+    needs: [publish, build-binaries]
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cardanowall-*
+          merge-multiple: true
+          path: dist
+
+      # One manifest over all five archives; a consumer verifies a download
+      # with `grep <archive> SHA256SUMS | sha256sum -c -`.
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create GitHub Release
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: 'Label 309 CLI ${{ github.ref_name }}'
           generate_release_notes: true
           draft: false
-          prerelease: ${{ steps.prerelease.outputs.is_prerelease }}
+          prerelease: ${{ needs.publish.outputs.is_prerelease }}
+          files: |
+            dist/*
+
+  # ---- Multi-arch GHCR image --------------------------------------------------
+  # Same shape as the label-309-gateway image release. Runs only on a real
+  # version tag (the image compiles against the just-published SDK, exactly like
+  # the binaries), so unlike a dry-run-capable image job the version and the
+  # push are unconditional here.
+  image:
+    needs: publish
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    # A QEMU-emulated arm64 Rust release build is slow; give the multi-arch
+    # build room while still capping the job.
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      # packages: write lets GITHUB_TOKEN push the image to this repo's GHCR namespace.
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/label-309-cli
+    steps:
+      - uses: actions/checkout@v6
+
+      # A final release moves `latest`; a pre-release (vX.Y.Z-rc.1) is published
+      # under its exact tag only. The git tag's `v` prefix is dropped per Docker
+      # convention.
+      - name: Derive image tags
+        id: meta
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "tags<<EOF"
+            echo "$IMAGE:$version"
+            if [[ "$version" != *-* ]]; then echo "$IMAGE:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v4.2.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4.1.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v7.2.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
