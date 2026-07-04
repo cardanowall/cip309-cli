@@ -14,9 +14,10 @@
 # rust:1-bookworm tracks the moving stable toolchain. The crate is rustls-only
 # (no system OpenSSL), so the build needs no system libs beyond the base image.
 #
-# The `cardanowall` SDK releases in lockstep with this CLI, so a freshly tagged
-# tree can carry a Cargo.lock whose SDK entry does not satisfy the exact
-# registry pin in Cargo.toml — it still lacks its registry source + checksum
+# The `cardanowall` SDK can release in the same coordinated window as this
+# CLI, so a freshly tagged tree can carry a Cargo.lock whose SDK entry does
+# not satisfy the exact registry pin in Cargo.toml — it still lacks its
+# registry source + checksum
 # (those exist only once the SDK is published), or it is a stale registry
 # entry for an older SDK version. In exactly those cases cargo's conservative
 # resolve (`cargo fetch`) re-resolves the SDK entry while keeping every other
@@ -49,11 +50,16 @@ RUN pin=$(grep -E '^cardanowall = "=' Cargo.toml | head -1 | sed -E 's/.*"=([^"]
 # ca-certificates: `verify`, `submit`, and `inbox` egress over HTTPS (public
 # Cardano explorers, Arweave/IPFS gateways, the configured service gateway),
 # all through rustls, which loads the system trust store.
+#
+# git + jq: the image doubles as a CI job image (the GitLab poe-attest
+# component runs in it directly). `attest --commits` shells out to git for
+# commit-object leaves, and CI wrappers map the attest receipt onto job
+# outputs with jq.
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates git jq \
  && rm -rf /var/lib/apt/lists/*
 
 # Run as an unprivileged user with a real home: the CLI persists gateway

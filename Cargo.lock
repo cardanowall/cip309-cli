@@ -174,6 +174,8 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "cardanowall"
 version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7f389c83ea0dd3a5f1c35c7faf6aa1ccfc07d59efdf465b24bec61f5cae8b72"
 dependencies = [
  "argon2",
  "blake2",
@@ -199,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "cardanowall-cli"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "cardanowall",
  "clap",

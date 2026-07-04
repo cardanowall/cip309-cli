@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-07-04
+
+No crate API or CLI behavior changes — distribution only.
+
+### Changed
+
+- The container image (`ghcr.io/cardanowall/label-309-cli`) now ships `git` and `jq` in the runtime stage: `attest --commits` works inside the container (it shells out to git), and CI wrappers that run the image as their job environment can map the attest receipt onto job outputs with jq.
+- Release assets (the five prebuilt binary archives and `SHA256SUMS`) now carry SLSA build-provenance attestations; verify a download with `gh attestation verify <file> --repo cardanowall/label-309-cli`.
+
 ## [0.9.0] - 2026-07-03
 
 ### Added

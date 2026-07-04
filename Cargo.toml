@@ -1,6 +1,6 @@
 [package]
 name = "cardanowall-cli"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["CardanoWall <hello@cardanowall.com>"]
@@ -24,9 +24,9 @@ path = "src/main.rs"
 [dependencies]
 # The Label 309 SDK crate `cardanowall` (from crates.io) — all record-prep,
 # verification, sealed-PoE, merkle, and gateway-client logic lives there;
-# this CLI is a thin argument-parsing + output shell over it. The two crates
-# release in lockstep, so the pin is exact: CLI X.Y.Z is built and tested
-# against SDK X.Y.Z and nothing else.
+# this CLI is a thin argument-parsing + output shell over it. The pin is
+# exact: this CLI release was built and tested against precisely this SDK
+# version and nothing else.
 cardanowall = "=0.9.0"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"

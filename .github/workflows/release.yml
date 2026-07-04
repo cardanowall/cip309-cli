@@ -18,10 +18,12 @@ name: release
 #      CARGO_REGISTRY_TOKEN secret; the crates-io-auth-action step below mints a
 #      short-lived token from this job's OIDC identity instead.
 #
-# This crate depends on the `cardanowall` SDK crate (label-309-rs). The two
-# release in lockstep from tags pushed at the same moment, so the publish job
-# polls the crates.io index until the SDK version matching this tag is live
-# before gating and publishing. Everything downstream of publish — the prebuilt
+# This crate depends on the `cardanowall` SDK crate (label-309-rs). On a
+# coordinated SDK-family release their tags are pushed at the same moment, so
+# the publish job polls the crates.io index until the pinned SDK version is
+# live before gating and publishing; a solo CLI release pins an
+# already-published SDK and the first poll succeeds. Everything downstream of
+# publish — the prebuilt
 # binaries, the GitHub Release, the GHCR image — compiles against that
 # published SDK, which is why those jobs run only on a real version tag and
 # never on a workflow_dispatch dry-run.
@@ -127,7 +129,8 @@ jobs:
           exit 1
 
       # ---- Reconcile the lockfile with the published SDK -----------------------
-      # The SDK releases in lockstep with this CLI, so a freshly tagged tree can
+      # The SDK can release in the same coordinated window as this CLI, so a
+      # freshly tagged tree can
       # carry a Cargo.lock whose `cardanowall` entry does not satisfy the exact
       # registry pin in Cargo.toml — either it still lacks its registry source +
       # checksum (those exist only once the SDK is published), or it is a stale
@@ -243,7 +246,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
-      # Same lockstep window (and the same gate) as the publish job: only touch
+      # Same coordinated-window hazard (and the same gate) as the publish job: only touch
       # the lock when its SDK entry does not satisfy the exact registry pin
       # (missing registry source, or a stale registry entry at another
       # version), and then only via cargo's conservative resolve. The SDK is
@@ -304,13 +307,18 @@ jobs:
           path: ${{ steps.archive.outputs.archive }}
           if-no-files-found: error
 
-  # ---- GitHub Release: archives + SHA256SUMS ---------------------------------
+  # ---- GitHub Release: archives + SHA256SUMS + provenance ---------------------
   release:
     needs: [publish, build-binaries]
     if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # id-token + attestations let the provenance step sign statements with
+      # this workflow's OIDC identity and store them in the repo's attestation
+      # log.
+      id-token: write
+      attestations: write
     steps:
       - name: Download binary archives
         uses: actions/download-artifact@v8
@@ -327,6 +335,17 @@ jobs:
           cd dist
           sha256sum -- *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
+
+      # SLSA build provenance over every published asset (five archives +
+      # SHA256SUMS), so a consumer can prove an asset was built by this
+      # workflow from this tag: `gh attestation verify <file> --repo <repo>`.
+      # Hash-pinned (unlike the plain build steps above) because this action
+      # mints signed statements — a hijacked moving tag could attest arbitrary
+      # subjects.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: dist/*
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
