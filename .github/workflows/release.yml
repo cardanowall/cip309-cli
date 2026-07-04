@@ -100,20 +100,22 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
 
       # ---- Wait for the SDK crate to be live on crates.io ----------------------
-      # In the coordinated release, label-309-rs publishes `cardanowall` and this
-      # repo publishes `cardanowall-cli` from tags pushed at the same moment, so
-      # the two release workflows race. This crate pins `cardanowall = "=<version>"`
-      # from crates.io, so BOTH the gate build below and the publish step need the
-      # SDK already in the registry index. Poll the sparse index — the exact source
-      # cargo resolves against — until the matching version appears (up to ~15
-      # minutes), then fail loudly with a re-run hint instead of erroring deep in a
-      # compile. Tag-push only: a workflow_dispatch dry-run carries no release
-      # version and skips this.
+      # This crate pins `cardanowall = "=<version>"` from crates.io, so BOTH the
+      # gate build below and the publish step need the SDK already in the registry
+      # index. The pinned version comes from Cargo.toml, NOT from the tag: the two
+      # crates version independently, so a solo CLI release routinely pins an SDK
+      # older than its own tag (the pin is already live and the first poll
+      # succeeds). Only in a coordinated SDK-family minor — tags pushed at the
+      # same moment — do the two release workflows race, and the poll rides out
+      # the window (up to ~15 minutes), then fails loudly with a re-run hint
+      # instead of erroring deep in a compile. Tag-push only: a workflow_dispatch
+      # dry-run carries no release version and skips this.
       - name: Wait for `cardanowall` SDK on crates.io
         if: ${{ github.event_name == 'push' }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
+          version=$(grep -E '^cardanowall = "' Cargo.toml | head -1 | sed -E 's/.*"=?([0-9][^"]*)".*/\1/')
+          if [ -z "$version" ]; then echo "::error::could not read the cardanowall SDK pin from Cargo.toml"; exit 1; fi
           url="https://index.crates.io/ca/rd/cardanowall"
           echo "Waiting for cardanowall@$version on the crates.io index..."
           for attempt in $(seq 1 90); do
