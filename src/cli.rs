@@ -25,7 +25,8 @@
 //! - `CARDANOWALL_RECIPIENT_KEY` ← `--secret-key`  (verify, inbox)
 //! - `CARDANOWALL_CARDANO_GATEWAY` / `CARDANOWALL_ARWEAVE_GATEWAY` /
 //!   `CARDANOWALL_IPFS_GATEWAY` / `CARDANOWALL_BLOCKFROST_PROJECT_ID` /
-//!   `CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD` / `CARDANOWALL_DENY_HOST`
+//!   `CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD` / `CARDANOWALL_DENY_HOST` /
+//!   `CARDANOWALL_DENY_HOSTS_REPLACE`
 //! - `CARDANOWALL_CONFIG_PATH` overrides `~/.cardanowall/config.toml`.
 
 use std::ffi::OsString;
@@ -50,7 +51,8 @@ use crate::util::version::version_string;
         CARDANOWALL_RECIPIENT_KEY  X25519 recipient key (hex)  (--secret-key)\n  \
         CARDANOWALL_CARDANO_GATEWAY / CARDANOWALL_ARWEAVE_GATEWAY /\n  \
         CARDANOWALL_IPFS_GATEWAY / CARDANOWALL_BLOCKFROST_PROJECT_ID /\n  \
-        CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD / CARDANOWALL_DENY_HOST\n  \
+        CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD / CARDANOWALL_DENY_HOST /\n  \
+        CARDANOWALL_DENY_HOSTS_REPLACE\n  \
         CARDANOWALL_CONFIG_PATH    overrides ~/.cardanowall/config.toml\n\n\
         High-secret flags (--seed, --secret-key) also accept a *-file / *-stdin\n\
         variant and, on a TTY, a hidden interactive prompt. --seed takes 64-digit\n\
@@ -128,7 +130,7 @@ pub enum Command {
     Submit(commands::submit::SubmitArgs),
     /// Anchor files, git commits, or digests as one PoE (CI-oriented).
     Attest(commands::attest::AttestArgs),
-    /// Publish a sealed PoE: encrypt a file to recipients and anchor it.
+    /// Publish a sealed PoE: encrypt files to recipients and anchor them.
     Seal(commands::seal::SealArgs),
     /// Offline PATH-1 (identity Ed25519) record signing.
     Sign(commands::sign::SignArgs),

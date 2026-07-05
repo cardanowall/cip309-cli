@@ -74,7 +74,7 @@ export CARDANOWALL_API_KEY=…        # from your CI secret store
 
 Add `--json` to any command for a machine-readable summary on stdout
 (diagnostics and errors go to stderr, as a structured
-`{"error":{"code":…,"message":…}}` object in JSON mode). The full variable
+`{"error":{"code":…,"message":…,"command":…}}` object in JSON mode). The full variable
 list is in [§10.2](#102-environment-variables).
 
 ---
@@ -91,7 +91,7 @@ goes on-chain — the bytes never leave your machine.
 cardanowall submit --file ./contract.pdf --wait confirmed
 ```
 
-You get back the record id, the Cardano transaction hash, the price, and your
+You get back the record id, the Cardano transaction hash, and your
 remaining balance. `--wait confirmed` blocks until the transaction crosses the
 confirmation threshold (typically 5–6 minutes on mainnet); use
 `--wait submitted` to return as soon as it reaches the network, or omit
@@ -342,6 +342,21 @@ Since every identity has both address forms, simply use the matching one.
 `--to-self` adds your own decryption slot under the same kind, so you can
 always re-open what you sent.
 
+`--file` is repeatable too: each file becomes one item of a single record —
+one anchor, one debit, every item sealed to the same recipients. Seal a
+cover letter and its contract together, readable by the same keys:
+
+```bash
+printf '%s' "$SEED" | cardanowall seal \
+  --file ./cover.pdf --file ./contract.pdf \
+  --to age1lnaqhwme7uv0y8daecmcry6ax9v5gq43sq0d24z9cwd39wg4qhysehy6zz \
+  --seed-stdin
+```
+
+Should the publish fail after any ciphertext upload already succeeded, the
+error lists the completed uploads (storage URI, byte count, ciphertext
+hash): that storage work was already paid for.
+
 Re-running `seal` publishes a NEW record and debits again: encryption is
 randomized by design, so a sealed record never reveals that it carries the
 same content as an earlier one.
@@ -501,6 +516,16 @@ The exit code IS the verdict: `0` valid, `1` invalid, `2` could not fetch,
 verifier from being silently steered back to a single operator's
 infrastructure.
 
+The deny list guards every outbound fetch the verifier makes: the record
+`uris` and the explorer / Arweave / IPFS resolver hops taken to reach them.
+`verify` has no service gateway of its own, so the resolvers you point it at
+are checked against the same list. `--deny-host` entries are APPENDED to the
+built-in defaults, so naming an extra host can never silently drop the
+loopback/metadata protection. `--deny-hosts-replace` makes your entries the
+whole list instead — the expert escape hatch for a private-network resolver
+(an internal Arweave mirror, arlocal on loopback) the defaults would block;
+replacing with no entries at all disables the deny list entirely.
+
 ### 9.2 An inclusion certificate, offline: `certificate verify`
 
 A certificate from [`attest --certificates-dir`](#46-receipts-and-inclusion-certificates)
@@ -524,7 +549,22 @@ cardanowall merkle verify --root <hex32> --leaf <hex32> --proof proof.json
 ```
 
 `merkle build` is the offline counterpart — it derives the root and the
-canonical leaves-list from a digest list without publishing anything.
+canonical leaves-list from a digest list (or from files to hash, with
+`--file`) without publishing anything. Its `--leaf-alg` tags the leaves-list
+with an advisory algorithm; the emitted artifact feeds `submit --merkle`
+directly, and that `leaf_alg` is carried into the published leaves-list:
+
+```bash
+# Build the canonical leaves-list (hex), tagging the leaf algorithm:
+cardanowall merkle build --file a.bin --file b.bin --leaf-alg sha2-256 --json \
+  | jq -r .leaves_list_cbor_hex > leaves-list.hex
+
+# Anchor the Merkle root; the leaf_alg is carried into the uploaded list:
+cardanowall submit --merkle leaves-list.hex --wait confirmed
+```
+
+`submit --merkle` also takes the raw leaves-list CBOR bytes, or a plain text
+file with one 64-hex leaf per line (which carries no `leaf_alg`).
 
 ---
 
@@ -545,19 +585,20 @@ canonical leaves-list from a digest list without publishing anything.
 Consistent across every command; an explicit flag always wins over the
 variable, which wins over the config file.
 
-| Variable                                   | Flag                | Meaning                                                                |
-| ------------------------------------------ | ------------------- | ---------------------------------------------------------------------- |
-| `CARDANOWALL_BASE_URL`                     | `--base-url`        | service gateway base URL                                               |
-| `CARDANOWALL_API_KEY`                      | `--api-key`         | opaque bearer API key                                                  |
-| `CARDANOWALL_SEED`                         | `--seed`            | seed (hex or `L309-SEED-1…`)                                           |
-| `CARDANOWALL_RECIPIENT_KEY`                | `--secret-key`      | X25519 recipient key(s)                                                |
-| `CARDANOWALL_CARDANO_GATEWAY`              | `--cardano-gateway` | Koios-compatible explorer URL(s)                                       |
-| `CARDANOWALL_ARWEAVE_GATEWAY`              | `--arweave-gateway` | Arweave gateway URL(s)                                                 |
-| `CARDANOWALL_IPFS_GATEWAY`                 | `--ipfs-gateway`    | IPFS gateway URL(s)                                                    |
-| `CARDANOWALL_BLOCKFROST_PROJECT_ID`        | `--blockfrost`      | Blockfrost fallback                                                    |
-| `CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD` | `--threshold`       | confirmation depth                                                     |
-| `CARDANOWALL_DENY_HOST`                    | `--deny-host`       | REPLACES the built-in egress deny list (you take over SSRF protection) |
-| `CARDANOWALL_CONFIG_PATH`                  | —                   | override the config file path                                          |
+| Variable                                   | Flag                   | Meaning                                                               |
+| ------------------------------------------ | ---------------------- | --------------------------------------------------------------------- |
+| `CARDANOWALL_BASE_URL`                     | `--base-url`           | service gateway base URL                                              |
+| `CARDANOWALL_API_KEY`                      | `--api-key`            | opaque bearer API key                                                 |
+| `CARDANOWALL_SEED`                         | `--seed`               | seed (hex or `L309-SEED-1…`)                                          |
+| `CARDANOWALL_RECIPIENT_KEY`                | `--secret-key`         | X25519 recipient key(s)                                               |
+| `CARDANOWALL_CARDANO_GATEWAY`              | `--cardano-gateway`    | Koios-compatible explorer URL(s)                                      |
+| `CARDANOWALL_ARWEAVE_GATEWAY`              | `--arweave-gateway`    | Arweave gateway URL(s)                                                |
+| `CARDANOWALL_IPFS_GATEWAY`                 | `--ipfs-gateway`       | IPFS gateway URL(s)                                                   |
+| `CARDANOWALL_BLOCKFROST_PROJECT_ID`        | `--blockfrost`         | Blockfrost fallback                                                   |
+| `CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD` | `--threshold`          | confirmation depth                                                    |
+| `CARDANOWALL_DENY_HOST`                    | `--deny-host`          | extra egress deny-list entries, appended to the built-in defaults     |
+| `CARDANOWALL_DENY_HOSTS_REPLACE`           | `--deny-hosts-replace` | the entries REPLACE the built-in list (none listed ⇒ nothing refused) |
+| `CARDANOWALL_CONFIG_PATH`                  | —                      | override the config file path                                         |
 
 ### 10.3 Secrets: sources and precedence
 
@@ -620,7 +661,7 @@ carries key material.
 | `items[]` or `merkle{root, leaf_count, publish, ar_uri}`                        | the record's content claim                                                |
 | `commits[]`                                                                     | per-leaf commit attribution (git mode)                                    |
 | `supersedes`                                                                    | the replaced transaction, when set                                        |
-| `poe_id`, `tx_hash`, `status`                                                   | the anchor                                                                |
+| `poe_id`, `tx_hash`, `status`, `gateway_base_url`                               | the anchor (and the gateway it was published through)                     |
 | `quote{…}`                                                                      | the consumed price lock (omitted on a replayed run — nothing was debited) |
 | `idempotency_key`, `replayed`                                                   | re-run facts                                                              |
 | `manifest{path, sha2_256, anchored}`                                            | the companion manifest                                                    |
@@ -631,16 +672,18 @@ carries key material.
 **Seal receipt** (`label-309-seal-receipt-v1`) — written by
 `seal --receipt-out`.
 
-| Field                                                                            | Meaning                                 |
-| -------------------------------------------------------------------------------- | --------------------------------------- |
-| `sealed{recipient_count, kem, to_self}`                                          | the envelope facts                      |
-| `item{sha2_256, ar_uri, ciphertext_bytes}`                                       | the content claim + ciphertext location |
-| `signed`, `signer_ed25519`                                                       | authorship facts                        |
-| `poe_id`, `tx_hash`, `status`, `quote{…}`, `wait{…}`, `balance_after_usd_micros` | as in the attest receipt                |
+| Field                                                                                                | Meaning                                                  |
+| ---------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `sealed{recipient_count, kem, to_self}`                                                              | the envelope facts                                       |
+| `items[]{sha2_256, ar_uri, ciphertext_bytes}`                                                        | per sealed file: the content claim + ciphertext location |
+| `record_hex`                                                                                         | the exact published canonical-CBOR record bytes          |
+| `signed`, `signer_ed25519`                                                                           | authorship facts                                         |
+| `poe_id`, `tx_hash`, `status`, `gateway_base_url`, `quote{…}`, `wait{…}`, `balance_after_usd_micros` | as in the attest receipt                                 |
 
 **Leaves list** — canonical CBOR (`cardano-poe-merkle-leaves-v1`), produced
 by `merkle build` and uploaded by full-tree publishes; carries the leaf
-digests, the root, and the leaf count. Any Label 309 tool decodes it.
+digests, the root, the leaf count, and the advisory `leaf_alg`. Any
+Label 309 tool decodes it.
 
 **Inclusion certificate** (`label-309-inclusion-certificate-v1`) — JSON from
 `attest --certificates-dir` or `certificate build`: the anchor (chain,

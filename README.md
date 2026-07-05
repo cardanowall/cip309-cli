@@ -113,19 +113,19 @@ Full task-oriented documentation with copy-pasteable examples for every
 capability lives in **[docs/GUIDE.md](docs/GUIDE.md)** — start there. Run
 `cardanowall <command> --help` for the authoritative flag list.
 
-| Command       | What it does                                                                                 |
-| ------------- | -------------------------------------------------------------------------------------------- |
-| `verify`      | Prove a record standalone against public explorers — no operator server, ever                |
-| `submit`      | Anchor hashes, files (optionally `--store` the bytes), Merkle roots, or pre-built records    |
-| `attest`      | Anchor a whole release / dataset / commit range as ONE record (CI-oriented; receipts, certs) |
-| `seal`        | Encrypt a file to recipients and anchor the proof — hash public, content recipient-only      |
-| `inbox`       | Discover, list, and decrypt sealed records addressed to your identity                        |
-| `identity`    | Generate a new identity (`--generate`) or inspect one: signing key + delivery addresses      |
-| `sign`        | Off-host / air-gapped record signing (`prepare` → external signer → `assemble`)              |
-| `merkle`      | Offline Merkle tooling: build roots and leaves-lists, verify inclusion proofs                |
-| `certificate` | Build and offline-verify per-item inclusion certificates                                     |
-| `gateway`     | Named gateway profiles (endpoint + API key), stored `0600`                                   |
-| `completion`  | Shell completion scripts (bash / zsh / fish / powershell)                                    |
+| Command       | What it does                                                                                       |
+| ------------- | -------------------------------------------------------------------------------------------------- |
+| `verify`      | Prove a record standalone against public explorers — no operator server, ever                      |
+| `submit`      | Anchor hashes, files (optionally `--store` the bytes), Merkle roots, or pre-built records          |
+| `attest`      | Anchor a whole release / dataset / commit range as ONE record (CI-oriented; receipts, certs)       |
+| `seal`        | Encrypt one or more files to recipients and anchor the proof — hash public, content recipient-only |
+| `inbox`       | Discover, list, and decrypt sealed records addressed to your identity                              |
+| `identity`    | Generate a new identity (`--generate`) or inspect one: signing key + delivery addresses            |
+| `sign`        | Off-host / air-gapped record signing (`prepare` → external signer → `assemble`)                    |
+| `merkle`      | Offline Merkle tooling: build roots and leaves-lists, verify inclusion proofs                      |
+| `certificate` | Build and offline-verify per-item inclusion certificates                                           |
+| `gateway`     | Named gateway profiles (endpoint + API key), stored `0600`                                         |
+| `completion`  | Shell completion scripts (bash / zsh / fish / powershell)                                          |
 
 ## Secrets & safety
 

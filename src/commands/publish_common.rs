@@ -13,7 +13,7 @@ use std::time::Duration;
 use cardanowall::client::{
     assemble_cose_sign1, prepare_sig_structure, ClientError, Label309Client, PoeEventsError,
     PoeNamespace, PoeStatusSnapshot, PoeWaitError, PoeWaitInput, PoeWaitTarget, PublishError,
-    PublishHelperError, QuoteInput, QuoteResponse, ResumableUploadError, Signer,
+    PublishHelperError, QuoteInput, QuoteResponse, ResumableUploadError, SealPrepareError, Signer,
     DEFAULT_EVENTS_BACKOFF,
 };
 use cardanowall::poe_standard::{encode_poe_record, PoeRecord};
@@ -35,6 +35,39 @@ use crate::util::{format_usd_micros, hex_to_bytes, CliError};
 #[must_use]
 pub fn arweave_uri_placeholder() -> String {
     format!("ar://{}", "A".repeat(43))
+}
+
+/// Idempotency-key role prefix for a merkle leaves-list storage upload. It is
+/// the same scheme the SDK merkle-publish helper uses, so a given leaves-list
+/// batch presents an identical key whether it is anchored inline (`attest
+/// --publish full-tree`) or through the SDK helper (`submit --merkle`).
+pub const LEAVES_LIST_UPLOAD_ROLE: &str = "merkle1-";
+
+/// Idempotency-key role prefix for a stored plaintext-content upload
+/// (`submit --file --store`). It is distinct from the leaves-list role so the
+/// same bytes uploaded in the two roles can never collide on one key.
+pub const STORED_CONTENT_UPLOAD_ROLE: &str = "content1-";
+
+/// How many leading hex digits of the content digest a storage-upload
+/// idempotency key carries. 128 bits is comfortably collision-resistant while
+/// keeping the key short; the SDK merkle/sealed upload keys use the same width.
+const UPLOAD_KEY_DIGEST_CHARS: usize = 32;
+
+/// Derive a deterministic idempotency key for a storage upload from the exact
+/// bytes being uploaded.
+///
+/// A storage upload is billed and lands before the record that references it is
+/// published. If the process dies in that gap and the command is re-run, a
+/// fresh upload session would bill the storage a second time. Keying the upload
+/// on a pure function of its content means the retry presents the same key, so
+/// the gateway replays the recorded upload instead of charging twice.
+///
+/// `role` names what is being uploaded (see the `*_UPLOAD_ROLE` prefixes) so two
+/// upload kinds never share a key even on identical bytes.
+#[must_use]
+pub fn content_upload_idempotency_key(role: &str, blob: &[u8]) -> String {
+    let digest = cardanowall::hex::encode(&cardanowall::hash::sha256(blob));
+    format!("{role}{}", &digest[..UPLOAD_KEY_DIGEST_CHARS])
 }
 
 /// The gateway inputs an anchoring command collects from argv.
@@ -184,6 +217,26 @@ pub fn map_publish_error(command: &str, err: PublishHelperError) -> CliError {
         }
         PublishHelperError::Http(client_error) => map_client_error(command, client_error),
         PublishHelperError::Crypto(msg) => CliError::network(format!("{command}: {msg}")),
+        // A sealed prepare/assembly failure: a crypto fault is network-class
+        // like the legacy Crypto arm; everything else is a pre-network
+        // input/shape error.
+        PublishHelperError::Prepare(e) => match e {
+            SealPrepareError::Crypto(_) => CliError::network(format!("{command}: {e}")),
+            other => CliError::input(format!("{command}: {other}")),
+        },
+        // The SDK-enforced price cap mirrors enforce_max_usd's refusal:
+        // integrity-class, nothing further gets spent.
+        PublishHelperError::MaxUsdExceeded {
+            quoted_usd_micros,
+            max_usd_micros,
+        } => CliError::integrity(format!(
+            "{command}: quoted price {} exceeds --max-usd {}; refusing to publish",
+            format_usd_micros(&quoted_usd_micros),
+            format_usd_micros(&max_usd_micros.to_string())
+        )),
+        PublishHelperError::InvalidUploadReceipt { detail } => {
+            CliError::input(format!("{command}: INVALID_UPLOAD_RECEIPT: {detail}"))
+        }
     }
 }
 

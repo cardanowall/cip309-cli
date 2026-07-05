@@ -10,8 +10,18 @@
 //!
 //! First non-empty source wins; lower-precedence sources are NOT merged in. URL
 //! shape is validated here (https-only, except loopback).
+//!
+//! Deny-hosts is the one slot with a second axis: the user's entries (picked
+//! by the same first-non-empty precedence) are APPENDED to the built-in SSRF
+//! deny list by default, so naming an extra host can never silently drop the
+//! loopback/metadata protection. The explicit replace toggle
+//! (`--deny-hosts-replace` / `CARDANOWALL_DENY_HOSTS_REPLACE` /
+//! `deny_hosts_replace`) makes the user's entries the WHOLE list — the expert
+//! escape hatch for a private-network resolver the defaults would block —
+//! and replacing with no entries at all disables the deny list entirely.
 
 use cardanowall::verifier::content::ARWEAVE_GATEWAY_DEFAULTS;
+use cardanowall::verifier::fetch::DENY_HOSTS_DEFAULT;
 use cardanowall::verifier::KOIOS_MAINNET_URL;
 
 use crate::config::read_config_file::CardanoWallConfig;
@@ -34,9 +44,11 @@ pub struct ResolvedGateways {
     pub ipfs_gateway_chain: Option<Vec<String>>,
     /// Confirmation-depth threshold, when set anywhere.
     pub confirmation_depth_threshold: Option<u32>,
-    /// Deny-host patterns, when set anywhere (the canonical default applies
-    /// downstream when this is `None`).
-    pub deny_hosts: Option<Vec<String>>,
+    /// The effective egress deny list for fetches whose URLs derive from
+    /// untrusted on-chain records: the built-in defaults plus the user's
+    /// entries, or the user's entries alone under replace mode. May be empty
+    /// (replace mode with no entries — the deny list is disabled).
+    pub deny_hosts: Vec<String>,
 }
 
 impl std::fmt::Debug for ResolvedGateways {
@@ -76,6 +88,8 @@ pub struct GatewayFlags {
     pub threshold: Option<u32>,
     /// `--deny-host` (repeatable).
     pub deny_host: Vec<String>,
+    /// `--deny-hosts-replace`.
+    pub deny_hosts_replace: bool,
 }
 
 impl std::fmt::Debug for GatewayFlags {
@@ -90,6 +104,7 @@ impl std::fmt::Debug for GatewayFlags {
             .field("ipfs_gateway", &self.ipfs_gateway)
             .field("threshold", &self.threshold)
             .field("deny_host", &self.deny_host)
+            .field("deny_hosts_replace", &self.deny_hosts_replace)
             .finish()
     }
 }
@@ -214,23 +229,64 @@ fn pick_threshold(
     Ok(None)
 }
 
+/// Resolve the deny-hosts replace toggle: flag presence wins, then the env
+/// variable, then the config key; the default is append mode.
+fn pick_deny_hosts_replace(
+    flag: bool,
+    env: Option<&str>,
+    cfg: Option<bool>,
+) -> Result<bool, CliError> {
+    if flag {
+        return Ok(true);
+    }
+    if let Some(e) = env {
+        let t = e.trim();
+        if !t.is_empty() {
+            return match t.to_ascii_lowercase().as_str() {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(CliError::input(format!(
+                    "verify: CARDANOWALL_DENY_HOSTS_REPLACE must be true/false/1/0; got \"{e}\""
+                ))),
+            };
+        }
+    }
+    Ok(cfg.unwrap_or(false))
+}
+
+/// Compute the effective deny list. The user's entries come from the first
+/// non-empty source (flag → env → config, like every other slot); append mode
+/// unions them with the built-in defaults, replace mode makes them the whole
+/// list. The union is deduplicated on the exact entry string, defaults first,
+/// so the effective order is stable.
 fn pick_deny_hosts(
     flag: &[String],
     env: Option<&str>,
     cfg: Option<&[String]>,
-) -> Option<Vec<String>> {
-    if !flag.is_empty() {
-        return Some(flag.to_vec());
-    }
-    if let Some(list) = split_env_list(env) {
-        return Some(list);
-    }
-    if let Some(c) = cfg {
-        if !c.is_empty() {
-            return Some(c.to_vec());
+    replace: bool,
+) -> Vec<String> {
+    let user: Vec<String> = if !flag.is_empty() {
+        flag.to_vec()
+    } else if let Some(list) = split_env_list(env) {
+        list
+    } else {
+        cfg.map(<[String]>::to_vec).unwrap_or_default()
+    };
+
+    let mut effective: Vec<String> = if replace {
+        Vec::new()
+    } else {
+        DENY_HOSTS_DEFAULT
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    };
+    for entry in user {
+        if !effective.contains(&entry) {
+            effective.push(entry);
         }
     }
-    None
+    effective
 }
 
 /// Validate a single gateway URL: https only, except http on loopback.
@@ -346,10 +402,16 @@ pub fn resolve_gateways(
         config.and_then(|c| c.confirmation_depth_threshold),
     )?;
 
+    let deny_hosts_replace = pick_deny_hosts_replace(
+        flags.deny_hosts_replace,
+        env.var("CARDANOWALL_DENY_HOSTS_REPLACE").as_deref(),
+        config.and_then(|c| c.deny_hosts_replace),
+    )?;
     let deny_hosts = pick_deny_hosts(
         &flags.deny_host,
         env.var("CARDANOWALL_DENY_HOST").as_deref(),
         config.and_then(|c| c.deny_host.as_deref()),
+        deny_hosts_replace,
     );
 
     Ok(ResolvedGateways {
@@ -497,6 +559,164 @@ mod tests {
             resolve_gateways(&flags, &env(&[]), None).unwrap_err().code,
             4
         );
+    }
+
+    fn defaults() -> Vec<String> {
+        DENY_HOSTS_DEFAULT
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn deny_hosts_default_to_the_built_in_list() {
+        let out = resolve_gateways(&GatewayFlags::default(), &env(&[]), None).unwrap();
+        assert_eq!(out.deny_hosts, defaults());
+    }
+
+    #[test]
+    fn deny_hosts_append_to_the_defaults_from_every_source() {
+        // Flag entries extend the built-in list; the defaults are never dropped.
+        let flags = GatewayFlags {
+            deny_host: vec!["metadata.internal".to_string()],
+            ..GatewayFlags::default()
+        };
+        let out = resolve_gateways(&flags, &env(&[]), None).unwrap();
+        let mut expected = defaults();
+        expected.push("metadata.internal".to_string());
+        assert_eq!(out.deny_hosts, expected);
+
+        // Env: comma-split, appended.
+        let out = resolve_gateways(
+            &GatewayFlags::default(),
+            &env(&[("CARDANOWALL_DENY_HOST", "a.example, b.example")]),
+            None,
+        )
+        .unwrap();
+        let mut expected = defaults();
+        expected.extend(["a.example".to_string(), "b.example".to_string()]);
+        assert_eq!(out.deny_hosts, expected);
+
+        // Config: appended.
+        let cfg = CardanoWallConfig {
+            deny_host: Some(vec!["c.example".to_string()]),
+            ..CardanoWallConfig::default()
+        };
+        let out = resolve_gateways(&GatewayFlags::default(), &env(&[]), Some(&cfg)).unwrap();
+        let mut expected = defaults();
+        expected.push("c.example".to_string());
+        assert_eq!(out.deny_hosts, expected);
+    }
+
+    #[test]
+    fn deny_hosts_union_is_deduplicated() {
+        // Re-naming a default, or repeating an entry, yields exactly one slot.
+        let flags = GatewayFlags {
+            deny_host: vec![
+                "localhost".to_string(),
+                "x.example".to_string(),
+                "x.example".to_string(),
+            ],
+            ..GatewayFlags::default()
+        };
+        let out = resolve_gateways(&flags, &env(&[]), None).unwrap();
+        let mut expected = defaults();
+        expected.push("x.example".to_string());
+        assert_eq!(out.deny_hosts, expected);
+    }
+
+    #[test]
+    fn deny_hosts_user_entries_follow_first_source_wins_precedence() {
+        // The flag supplies the user entries; env and config entries are NOT
+        // merged in (same precedence rule as every other slot) — only the
+        // built-in defaults join the union.
+        let flags = GatewayFlags {
+            deny_host: vec!["flag.example".to_string()],
+            ..GatewayFlags::default()
+        };
+        let cfg = CardanoWallConfig {
+            deny_host: Some(vec!["config.example".to_string()]),
+            ..CardanoWallConfig::default()
+        };
+        let out = resolve_gateways(
+            &flags,
+            &env(&[("CARDANOWALL_DENY_HOST", "env.example")]),
+            Some(&cfg),
+        )
+        .unwrap();
+        let mut expected = defaults();
+        expected.push("flag.example".to_string());
+        assert_eq!(out.deny_hosts, expected);
+    }
+
+    #[test]
+    fn deny_hosts_replace_makes_the_user_entries_the_whole_list() {
+        let flags = GatewayFlags {
+            deny_host: vec!["only.example".to_string()],
+            deny_hosts_replace: true,
+            ..GatewayFlags::default()
+        };
+        let out = resolve_gateways(&flags, &env(&[]), None).unwrap();
+        assert_eq!(out.deny_hosts, vec!["only.example".to_string()]);
+    }
+
+    #[test]
+    fn deny_hosts_replace_with_no_entries_disables_the_list() {
+        let flags = GatewayFlags {
+            deny_hosts_replace: true,
+            ..GatewayFlags::default()
+        };
+        let out = resolve_gateways(&flags, &env(&[]), None).unwrap();
+        assert!(out.deny_hosts.is_empty());
+    }
+
+    #[test]
+    fn deny_hosts_replace_toggle_resolves_from_env_and_config() {
+        // Env toggle + config entries: the config list replaces the defaults.
+        let cfg = CardanoWallConfig {
+            deny_host: Some(vec!["mirror.internal".to_string()]),
+            ..CardanoWallConfig::default()
+        };
+        let out = resolve_gateways(
+            &GatewayFlags::default(),
+            &env(&[("CARDANOWALL_DENY_HOSTS_REPLACE", "true")]),
+            Some(&cfg),
+        )
+        .unwrap();
+        assert_eq!(out.deny_hosts, vec!["mirror.internal".to_string()]);
+
+        // Config toggle alone.
+        let cfg = CardanoWallConfig {
+            deny_host: Some(vec!["mirror.internal".to_string()]),
+            deny_hosts_replace: Some(true),
+            ..CardanoWallConfig::default()
+        };
+        let out = resolve_gateways(&GatewayFlags::default(), &env(&[]), Some(&cfg)).unwrap();
+        assert_eq!(out.deny_hosts, vec!["mirror.internal".to_string()]);
+
+        // An explicit env "false" overrides a config "true".
+        let out = resolve_gateways(
+            &GatewayFlags::default(),
+            &env(&[("CARDANOWALL_DENY_HOSTS_REPLACE", "false")]),
+            Some(&cfg),
+        )
+        .unwrap();
+        let mut expected = defaults();
+        expected.push("mirror.internal".to_string());
+        assert_eq!(out.deny_hosts, expected);
+    }
+
+    #[test]
+    fn deny_hosts_replace_env_rejects_non_boolean_values() {
+        for bad in ["banana", "yes", "2"] {
+            let err = resolve_gateways(
+                &GatewayFlags::default(),
+                &env(&[("CARDANOWALL_DENY_HOSTS_REPLACE", bad)]),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(err.code, 4, "env toggle {bad:?} must be an input error");
+        }
     }
 
     #[test]

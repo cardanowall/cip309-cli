@@ -7,8 +7,12 @@
 //!   `items[i]` per digest; `--alg` applies to all of them)
 //! - `--file <path>`           hash the file contents and anchor the digest;
 //!   add `--store` to also upload the plaintext and bind its `ar://` URI
-//! - `--merkle <leaves-file>`  read one 64-hex leaf per line, build a Merkle tree,
-//!   anchor the root + leaves-list (Arweave)
+//! - `--merkle <leaves-file>`  anchor a Merkle commitment. The file is either
+//!   the canonical leaves-list artifact `merkle build` emits
+//!   (`cardano-poe-merkle-leaves-v1` CBOR, raw bytes or hex text — its
+//!   advisory `leaf_alg` travels into the uploaded list) or a plain text
+//!   file with one 64-hex leaf per line; the root + leaves-list (Arweave)
+//!   are anchored
 //! - `--record <file|->`       publish a pre-built canonical-CBOR record
 //!   byte-for-byte (hex text or raw bytes; validated locally first). This
 //!   closes the air-gap loop: `sign prepare` → external signer →
@@ -53,9 +57,9 @@ use cardanowall::client::{
     Label309Client, Label309ClientConfig, MerkleLeaf, PublishInput, PublishMerkleInput, QuoteInput,
     ResumableSource, ResumableUploadInput, Signer,
 };
-use cardanowall::estimate::{ItemShape, MerkleShape, RecordShape};
+use cardanowall::estimate::{ItemShape, RecordShape};
 use cardanowall::hash::{blake2b256, sha256};
-use cardanowall::merkle::{encode_leaves_list, merkle_root, MERKLE_ALG_ID};
+use cardanowall::merkle::{decode_leaves_list, DecodedLeavesList, MerkleLeavesListError};
 use cardanowall::poe_standard::{
     validate_poe_record, ItemEntry, PoeRecord, ValidateResult, ValidatorOptions,
 };
@@ -64,13 +68,15 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::commands::publish_common::{
-    arweave_uri_placeholder, encode_record_with_signer, enforce_max_usd, map_client_error,
-    map_publish_error, map_upload_error, parse_supersedes, refresh_quote_if_stale,
-    resolve_optional_signer, resolve_required_gateway, wait_for_poe_target, GatewayArgs,
-    WaitOutcome, WaitTargetArg,
+    arweave_uri_placeholder, content_upload_idempotency_key, encode_record_with_signer,
+    enforce_max_usd, map_client_error, map_publish_error, map_upload_error, parse_supersedes,
+    refresh_quote_if_stale, resolve_optional_signer, resolve_required_gateway, wait_for_poe_target,
+    GatewayArgs, WaitOutcome, WaitTargetArg, STORED_CONTENT_UPLOAD_ROLE,
 };
 use crate::secret::{SecretArgs, SecretEnv, ServiceGateway, SystemSecretEnv};
-use crate::util::{format_usd_micros, hex_to_bytes, is_all_hex, parse_usd_to_micros, CliError};
+use crate::util::{
+    bytes_to_hex, format_usd_micros, hex_to_bytes, is_all_hex, parse_usd_to_micros, CliError,
+};
 
 /// The storage backend `--store` uploads plaintext content to.
 const STORAGE_TARGET_ARWEAVE: &str = "arweave";
@@ -117,7 +123,10 @@ pub struct SubmitArgs {
     /// returned ar:// URI into the record (a public attachment).
     #[arg(long)]
     pub store: bool,
-    /// file with one 64-hex sha2-256 leaf per line; anchors a Merkle root.
+    /// leaves to commit under one Merkle root: the canonical leaves-list
+    /// artifact from `merkle build` (CBOR, raw bytes or hex text; carries the
+    /// advisory leaf_alg), or a plain text file with one 64-hex sha2-256 leaf
+    /// per line.
     #[arg(long)]
     pub merkle: Option<String>,
     /// pre-built canonical-CBOR record to publish byte-for-byte (a file path,
@@ -220,6 +229,10 @@ struct SubmitOutcome {
     id: String,
     tx_hash: Option<String>,
     status: String,
+    /// The exact canonical-CBOR record bytes that were published, hex-encoded
+    /// — archive them; a verifier compares them against the on-chain
+    /// metadata byte for byte.
+    record_hex: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     items_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -328,6 +341,55 @@ fn resolve_hash_alg(args: &SubmitArgs) -> Result<HashAlg, CliError> {
             "submit: --alg must be 'sha2-256' or 'blake2b-256' (got '{other}')"
         ))),
     }
+}
+
+/// Load the `--merkle` leaves input: the leaf set plus the advisory
+/// `leaf_alg` to carry into the uploaded leaves-list.
+///
+/// Two on-disk shapes are accepted:
+///
+/// - the canonical leaves-list artifact `merkle build` emits
+///   (`cardano-poe-merkle-leaves-v1` CBOR) — as raw bytes, or as the hex text
+///   the build outcome prints. Its `leaf_alg`, when present, travels into the
+///   published leaves-list unchanged;
+/// - a plain text file with one 64-hex leaf per line, which carries no
+///   `leaf_alg` claim.
+fn load_merkle_leaves(path: &str) -> Result<(Vec<MerkleLeaf>, Option<String>), CliError> {
+    let raw = std::fs::read(path)
+        .map_err(|e| CliError::network(format!("submit: cannot read --merkle {path}: {e}")))?;
+    let artifact_error = |e: MerkleLeavesListError| {
+        CliError::input(format!(
+            "submit: --merkle {path} is not a valid leaves-list artifact: {e}"
+        ))
+    };
+    let Ok(text) = std::str::from_utf8(&raw) else {
+        // Not text at all: only the raw-CBOR artifact shape can apply.
+        let decoded = decode_leaves_list(&raw).map_err(artifact_error)?;
+        return Ok(leaves_input_from_artifact(decoded));
+    };
+    let trimmed = text.trim();
+    // A single hex blob that cannot be one 64-hex leaf line is the artifact in
+    // its hex-text form (the shape the `merkle build` outcome prints).
+    if !trimmed.is_empty() && trimmed.len() != 64 && is_all_hex(trimmed) {
+        let bytes = hex_to_bytes(trimmed)
+            .map_err(|e| CliError::input(format!("submit: --merkle {path}: {e}")))?;
+        let decoded = decode_leaves_list(&bytes).map_err(artifact_error)?;
+        return Ok(leaves_input_from_artifact(decoded));
+    }
+    let leaves = parse_leaves_file(text, path)?;
+    Ok((leaves.into_iter().map(MerkleLeaf::Hex).collect(), None))
+}
+
+/// Lower a decoded leaves-list artifact to the publish input's leaf shape.
+fn leaves_input_from_artifact(decoded: DecodedLeavesList) -> (Vec<MerkleLeaf>, Option<String>) {
+    (
+        decoded
+            .leaves
+            .into_iter()
+            .map(|leaf| MerkleLeaf::Bytes(leaf.to_vec()))
+            .collect(),
+        decoded.leaf_alg,
+    )
 }
 
 fn parse_leaves_file(text: &str, path: &str) -> Result<Vec<String>, CliError> {
@@ -443,6 +505,7 @@ fn publish_record_bytes(
     idempotency_key: Option<&str>,
     mode: Mode,
 ) -> Result<SubmitOutcome, CliError> {
+    let record_hex = bytes_to_hex(&record_bytes);
     let res = poe
         .publish(&PublishInput {
             record: record_bytes,
@@ -456,6 +519,7 @@ fn publish_record_bytes(
         id: res.id,
         tx_hash: res.tx_hash,
         status: res.status.normalized().as_str().to_string(),
+        record_hex,
         items_count: Some(res.items_count),
         root: None,
         leaf_count: None,
@@ -497,11 +561,13 @@ fn publish_stored_file(
         .quote(&quote_input)
         .map_err(|e| map_client_error("submit", e))?;
     enforce_max_usd("submit", inputs.max_usd_micros, &quote)?;
+    let upload_key = content_upload_idempotency_key(STORED_CONTENT_UPLOAD_ROLE, &content);
     let upload = poe
         .upload_resumable(&ResumableUploadInput {
             target: STORAGE_TARGET_ARWEAVE.to_string(),
             source: ResumableSource::Bytes(content),
             content_type: Some("application/octet-stream".to_string()),
+            idempotency_key: Some(upload_key),
             ..ResumableUploadInput::default()
         })
         .map_err(|e| map_upload_error("submit", e))?;
@@ -694,10 +760,7 @@ pub fn run(args: SubmitArgs) -> Result<(), CliError> {
         }
         Mode::Merkle => {
             let path = args.merkle.as_ref().unwrap();
-            let text = std::fs::read_to_string(path).map_err(|e| {
-                CliError::network(format!("submit: cannot read --merkle {path}: {e}"))
-            })?;
-            let leaves_hex = parse_leaves_file(&text, path)?;
+            let (leaves, leaf_alg) = load_merkle_leaves(path)?;
             let alg = args
                 .alg
                 .as_deref()
@@ -708,54 +771,32 @@ pub fn run(args: SubmitArgs) -> Result<(), CliError> {
                     "submit: --merkle currently supports only sha2-256 leaves (got '{alg}')"
                 )));
             }
-            // The exact leaves-list byte count feeds the quote's storage side;
-            // the record side is the exact-width upper-bound estimate, because
-            // the ar:// URI only exists after the upload the helper performs.
-            let leaf_arrays: Vec<[u8; 32]> = leaves_hex
-                .iter()
-                .map(|h| {
-                    let bytes = hex_to_bytes(h).expect("validated 64-hex leaf");
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    arr
+            // The SDK helper owns the priced flow: it quotes from the
+            // exact-width estimate, enforces the cap, uploads the
+            // leaves-list, and refreshes a stale price lock before the
+            // publish.
+            let max_usd_micros_u64: Option<u64> = max_usd_micros
+                .map(|value| {
+                    u64::try_from(value).map_err(|_| {
+                        CliError::input("submit: --max-usd is out of range".to_string())
+                    })
                 })
-                .collect();
-            let root =
-                merkle_root(&leaf_arrays).map_err(|e| CliError::input(format!("submit: {e}")))?;
-            let leaves_list = encode_leaves_list(&leaf_arrays, &root, None)
-                .map_err(|e| CliError::input(format!("submit: {e}")))?;
-            let shape = RecordShape {
-                items: vec![],
-                signed: signer.is_some(),
-                supersedes: false,
-                merkle: Some(MerkleShape {
-                    alg: MERKLE_ALG_ID.to_string(),
-                    uris: vec![arweave_uri_placeholder()],
-                }),
-            };
-            let quote = poe
-                .quote(&QuoteInput {
-                    record_bytes: shape.estimate_record_bytes(),
-                    recipient_count: 0,
-                    file_bytes_total: leaves_list.len() as u64,
-                })
-                .map_err(|e| map_client_error("submit", e))?;
-            enforce_max_usd("submit", max_usd_micros, &quote)?;
+                .transpose()?;
+            let mut input = PublishMerkleInput::new(leaves);
+            input.leaf_alg = leaf_alg;
+            input.signer = signer_ref;
+            input.max_usd_micros = max_usd_micros_u64;
+            input.idempotency_key = args.idempotency_key.clone();
+            input.chunk_bytes = args.chunk_bytes;
             let res = poe
-                .publish_merkle(&PublishMerkleInput {
-                    leaves: leaves_hex.into_iter().map(MerkleLeaf::Hex).collect(),
-                    quote_id: quote.quote_id,
-                    hash_alg: None,
-                    signer: signer_ref,
-                    idempotency_key: args.idempotency_key.clone(),
-                    chunk_bytes: args.chunk_bytes,
-                })
+                .publish_merkle(&input)
                 .map_err(|e| map_publish_error("submit", e))?;
             SubmitOutcome {
                 mode: "merkle",
                 id: res.id,
                 tx_hash: res.tx_hash,
                 status: res.status.normalized().as_str().to_string(),
+                record_hex: bytes_to_hex(&res.record_bytes),
                 items_count: None,
                 root: Some(res.root),
                 leaf_count: Some(res.leaf_count),
@@ -935,6 +976,84 @@ mod tests {
     #[test]
     fn rejects_bad_leaf() {
         assert_eq!(parse_leaves_file("zzz\n", "f").unwrap_err().code, 4);
+    }
+
+    /// The canonical leaves-list artifact for two fixed leaves, with the
+    /// advisory `leaf_alg` set — what `merkle build --leaf-alg` emits.
+    fn leaves_artifact() -> (Vec<[u8; 32]>, Vec<u8>) {
+        use cardanowall::merkle::{encode_leaves_list, merkle_root};
+        let leaves: Vec<[u8; 32]> = (0u8..2).map(|i| sha256(&[i])).collect();
+        let root = merkle_root(&leaves).unwrap();
+        let cbor = encode_leaves_list(&leaves, &root, Some("sha2-256")).unwrap();
+        (leaves, cbor)
+    }
+
+    fn write_merkle_input(dir: &tempfile::TempDir, name: &str, bytes: &[u8]) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// The raw digest a loaded leaf resolves to, whichever variant carries it.
+    fn leaf_digests(leaves: &[MerkleLeaf]) -> Vec<Vec<u8>> {
+        leaves
+            .iter()
+            .map(|leaf| match leaf {
+                MerkleLeaf::Bytes(bytes) => bytes.clone(),
+                MerkleLeaf::Hex(hex) => hex_to_bytes(hex).unwrap(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merkle_input_accepts_the_artifact_as_raw_bytes_and_as_hex_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let (leaves, cbor) = leaves_artifact();
+        let expected: Vec<Vec<u8>> = leaves.iter().map(|l| l.to_vec()).collect();
+
+        let raw_path = write_merkle_input(&dir, "leaves.cbor", &cbor);
+        let (loaded, leaf_alg) = load_merkle_leaves(&raw_path).unwrap();
+        assert_eq!(leaf_digests(&loaded), expected);
+        assert_eq!(leaf_alg.as_deref(), Some("sha2-256"));
+
+        let hex_path = write_merkle_input(&dir, "leaves.hex", bytes_to_hex(&cbor).as_bytes());
+        let (loaded, leaf_alg) = load_merkle_leaves(&hex_path).unwrap();
+        assert_eq!(leaf_digests(&loaded), expected);
+        assert_eq!(leaf_alg.as_deref(), Some("sha2-256"));
+    }
+
+    #[test]
+    fn merkle_input_falls_back_to_leaf_lines_with_no_leaf_alg_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = format!("{}\n{}\n", "ab".repeat(32), "cd".repeat(32));
+        let path = write_merkle_input(&dir, "leaves.txt", lines.as_bytes());
+        let (loaded, leaf_alg) = load_merkle_leaves(&path).unwrap();
+        assert_eq!(leaf_digests(&loaded), vec![vec![0xab; 32], vec![0xcd; 32]],);
+        assert_eq!(leaf_alg, None);
+
+        // A lone 64-hex line is one leaf, never mistaken for an artifact blob.
+        let single =
+            write_merkle_input(&dir, "one.txt", format!("{}\n", "ef".repeat(32)).as_bytes());
+        let (loaded, leaf_alg) = load_merkle_leaves(&single).unwrap();
+        assert_eq!(leaf_digests(&loaded), vec![vec![0xef; 32]]);
+        assert_eq!(leaf_alg, None);
+    }
+
+    #[test]
+    fn merkle_input_rejects_a_corrupt_artifact_as_input_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mut cbor) = leaves_artifact();
+        // Flip a byte inside the root so the codec's root check fails.
+        let index = cbor.len() / 2;
+        cbor[index] ^= 0xff;
+        let path = write_merkle_input(&dir, "corrupt.cbor", &cbor);
+        let err = load_merkle_leaves(&path).unwrap_err();
+        assert_eq!(err.code, 4);
+        assert!(
+            err.message.contains("leaves-list artifact"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

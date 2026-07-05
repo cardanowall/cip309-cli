@@ -68,9 +68,10 @@ use sha2::{Digest, Sha256};
 
 use crate::commands::certificate::NetworkArg;
 use crate::commands::publish_common::{
-    arweave_uri_placeholder, encode_record_with_signer, enforce_max_usd, map_client_error,
-    map_upload_error, parse_supersedes, refresh_quote_if_stale, resolve_optional_signer,
-    resolve_required_gateway, wait_for_poe_target, GatewayArgs, WaitOutcome, WaitTargetArg,
+    arweave_uri_placeholder, content_upload_idempotency_key, encode_record_with_signer,
+    enforce_max_usd, map_client_error, map_upload_error, parse_supersedes, refresh_quote_if_stale,
+    resolve_optional_signer, resolve_required_gateway, wait_for_poe_target, GatewayArgs,
+    WaitOutcome, WaitTargetArg, LEAVES_LIST_UPLOAD_ROLE,
 };
 use crate::secret::{SecretArgs, SystemSecretEnv};
 use crate::util::rfc3339::rfc3339_to_epoch_seconds;
@@ -835,11 +836,13 @@ fn publish_merkle_batch(
                 .quote(&quote_input)
                 .map_err(|e| map_client_error("attest", e))?;
             enforce_max_usd("attest", max_usd_micros, &quote)?;
+            let upload_key = content_upload_idempotency_key(LEAVES_LIST_UPLOAD_ROLE, &leaves_list);
             let upload = poe
                 .upload_resumable(&ResumableUploadInput {
                     target: STORAGE_TARGET_ARWEAVE.to_string(),
                     source: ResumableSource::Bytes(leaves_list),
                     content_type: Some("application/octet-stream".to_string()),
+                    idempotency_key: Some(upload_key),
                     ..ResumableUploadInput::default()
                 })
                 .map_err(|e| map_upload_error("attest", e))?;
@@ -1008,10 +1011,10 @@ struct ReceiptWait {
     num_confirmations: u64,
 }
 
-/// The versioned attest receipt (`label-309-attest-receipt-v1`), a public
-/// output contract from CLI 0.9.0. Carries everything needed to audit and
-/// re-verify the anchor later; NEVER the API key or any seed material (the
-/// signer's public key is, by definition, public).
+/// The versioned attest receipt (`label-309-attest-receipt-v1`), a stable
+/// public output contract. Carries everything needed to audit and re-verify
+/// the anchor later; NEVER the API key or any seed material (the signer's
+/// public key is, by definition, public).
 #[derive(Debug, Serialize)]
 struct AttestReceipt {
     format: &'static str,

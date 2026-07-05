@@ -9,6 +9,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] - 2026-07-05
+
+Built and tested against the `cardanowall` SDK 0.10.0.
+
+### Added
+
+- `seal` takes a repeatable `--file`: each file becomes one item of a single sealed record (shared recipients, one KEM). The seal receipt (`label-309-seal-receipt-v1`) gains a top-level `record_hex` and per-item entries; if a publish fails after the ciphertext uploads are paid for, both the human and JSON error output list every completed upload receipt so the work is not lost.
+- `submit --json` includes `record_hex` (the exact published record bytes) in every mode; `submit --merkle` accepts the canonical leaves-list artifact from `merkle build --leaf-alg` and carries its `leaf_alg` into the record.
+- `--deny-hosts-replace` (config `deny_hosts_replace`, env `CARDANOWALL_DENY_HOSTS_REPLACE`) replaces the built-in SSRF deny list entirely, for a private-network resolver such as an internal Arweave mirror.
+
+### Changed
+
+- `--deny-host` entries now APPEND to the built-in deny list instead of replacing it, so naming an extra host can never silently drop the loopback/metadata protection. In `verify` and `certificate`, which have no service gateway, the help states the real scope: the deny list guards egress to URLs derived from untrusted on-chain records.
+- The `attest` leaves-list upload and `submit --file --store` content upload now send a deterministic idempotency key, so a crash-and-retry between the paid upload and the publish never re-pays storage.
+
 ## [0.9.1] - 2026-07-04
 
 No crate API or CLI behavior changes — distribution only.

@@ -102,7 +102,19 @@ pub fn stub_tx_hash() -> String {
     "ab".repeat(32)
 }
 pub fn stub_ar_uri() -> String {
-    format!("ar://{}", "T".repeat(43))
+    stub_upload_uri(1)
+}
+
+/// The URI the stub mints for the Nth (1-based) storage upload of a run: each
+/// upload gets a distinct 43-character transaction id, so multi-item flows
+/// can assert which upload landed in which record slot.
+pub fn stub_upload_uri(seq: usize) -> String {
+    assert!((1..=9).contains(&seq), "stub supports 9 uploads per run");
+    if seq == 1 {
+        format!("ar://{}", "T".repeat(43))
+    } else {
+        format!("ar://{}{seq}", "T".repeat(42))
+    }
 }
 
 /// How `POST /poe/publish` responds.
@@ -113,6 +125,10 @@ pub enum PublishBehavior {
     /// `200 OK`, the dedup hit: the RAW engine `submitted` status plus the tx —
     /// exactly what the gateway echoes for a byte-identical re-POST.
     DedupRawSubmitted,
+    /// `400 Bad Request` with a typed problem body: the publish is rejected
+    /// after any uploads already succeeded (scripts the paid-upload error
+    /// path).
+    Reject,
 }
 
 /// One scripted SSE frame.
@@ -291,6 +307,12 @@ fn publish_response(config: &StubConfig) -> (u16, String) {
                 stub_tx_hash()
             ),
         ),
+        PublishBehavior::Reject => (
+            400,
+            "{\"type\":\"about:blank\",\"title\":\"Bad Request\",\"status\":400,\
+             \"code\":\"record-rejected\",\"detail\":\"stub: publish rejected by script\"}"
+                .to_string(),
+        ),
     }
 }
 
@@ -335,10 +357,18 @@ fn handle_connection(
         );
         write_json(&mut stream, 200, &body);
     } else if request.method == "POST" && request.path.ends_with("/poe/uploads") {
+        // The 1-based sequence number of THIS upload: each one mints a
+        // distinct URI, like a real gateway minting distinct transactions.
+        let seq = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path.ends_with("/poe/uploads"))
+            .count();
         let body = format!(
             "{{\"uploads\":[{{\"idx\":0,\"ok\":true,\"uri\":\"{}\",\"sha256\":\"{}\",\
              \"bytes\":{}}}]}}",
-            stub_ar_uri(),
+            stub_upload_uri(seq),
             "0".repeat(64),
             request.body.len()
         );
@@ -443,6 +473,7 @@ fn write_response(stream: &mut TcpStream, status: u16, extra_headers: &[(&str, &
     let reason = match status {
         200 => "OK",
         202 => "Accepted",
+        400 => "Bad Request",
         404 => "Not Found",
         409 => "Conflict",
         _ => "OK",

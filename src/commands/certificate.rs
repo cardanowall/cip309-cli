@@ -42,7 +42,7 @@ use cardanowall::poe_standard::{
 use cardanowall::verifier::content::{
     walk_blob_sources, BlobWalkEnd, ContentFetchPolicy, SourceDecision,
 };
-use cardanowall::verifier::fetch::{ReqwestTransport, DENY_HOSTS_DEFAULT};
+use cardanowall::verifier::fetch::ReqwestTransport;
 use cardanowall::verifier::{
     extract_label_309_metadata, resolve_cardano_tx, GatewayFetcher, VerifierIssue,
 };
@@ -200,11 +200,18 @@ pub struct CertificateBuildArgs {
     /// Used only to auto-fetch the leaves-list with --tx.
     #[arg(long = "arweave-gateway")]
     pub arweave_gateway: Vec<String>,
-    /// REPLACES the built-in egress deny list (repeatable; or env
-    /// CARDANOWALL_DENY_HOST): when set, only the hosts you list are refused —
-    /// you take over SSRF protection. Meant for loopback/dev gateways.
+    /// extra entries for the egress deny list (repeatable; or env
+    /// CARDANOWALL_DENY_HOST), appended to the built-in defaults. Applies to
+    /// URLs taken from on-chain records.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
+    /// the --deny-host entries REPLACE the built-in deny list instead of
+    /// appending (or env CARDANOWALL_DENY_HOSTS_REPLACE / config
+    /// deny_hosts_replace). With no entries listed, NOTHING is refused — you
+    /// take over SSRF protection entirely. Meant for private-network
+    /// resolvers (e.g. an internal Arweave mirror, or arlocal on loopback).
+    #[arg(long = "deny-hosts-replace")]
+    pub deny_hosts_replace: bool,
     /// Write the JSON certificate here (default: stdout).
     #[arg(long = "out")]
     pub out: Option<String>,
@@ -239,6 +246,7 @@ impl std::fmt::Debug for CertificateBuildArgs {
             )
             .field("arweave_gateway", &self.arweave_gateway)
             .field("deny_host", &self.deny_host)
+            .field("deny_hosts_replace", &self.deny_hosts_replace)
             .field("out", &self.out)
             .field("cbor_dir", &self.cbor_dir)
             .field("json", &self.json)
@@ -327,13 +335,12 @@ fn run_build(args: CertificateBuildArgs) -> Result<(), CliError> {
     // Build the shared egress only when the network is actually needed, so an
     // offline build never constructs a transport.
     let resolved_gateways = resolve_gateways_for(&args)?;
-    let deny_hosts = deny_hosts_or_default(&resolved_gateways);
     // The transport carries the deny list so its redirect-policy closure
     // re-applies the same list the fetcher's initial-URL guard uses.
-    let transport = ReqwestTransport::with_deny_hosts(deny_hosts.clone());
+    let transport = ReqwestTransport::with_deny_hosts(resolved_gateways.deny_hosts.clone());
 
     let anchor_facts: Option<ResolvedAnchorFacts> = if need_network {
-        let mut fetcher = GatewayFetcher::new(&transport, Some(&deny_hosts));
+        let mut fetcher = GatewayFetcher::new(&transport, Some(&resolved_gateways.deny_hosts));
         Some(resolve_anchor_facts(
             &tx_hash,
             &resolved_gateways,
@@ -353,7 +360,7 @@ fn run_build(args: CertificateBuildArgs) -> Result<(), CliError> {
         let facts = anchor_facts
             .as_ref()
             .expect("network resolve runs whenever the leaves-list is auto-fetched");
-        let mut fetcher = GatewayFetcher::new(&transport, Some(&deny_hosts));
+        let mut fetcher = GatewayFetcher::new(&transport, Some(&resolved_gateways.deny_hosts));
         fetch_leaves_list_from_record(&facts.merkle, &resolved_gateways, &mut fetcher)?
     };
 
@@ -788,6 +795,7 @@ fn resolve_gateways_for(args: &CertificateBuildArgs) -> Result<ResolvedGateways,
         blockfrost: args.blockfrost.clone(),
         arweave_gateway: args.arweave_gateway.clone(),
         deny_host: args.deny_host.clone(),
+        deny_hosts_replace: args.deny_hosts_replace,
         ..GatewayFlags::default()
     };
     let config = read_config_file(&SystemConfigEnv).map_err(relabel)?;
@@ -801,16 +809,6 @@ fn relabel(err: CliError) -> CliError {
         code: err.code,
         message: err.message.replacen("verify:", "certificate build:", 1),
     }
-}
-
-/// The canonical deny-list applies when the user configured none.
-fn deny_hosts_or_default(resolved: &ResolvedGateways) -> Vec<String> {
-    resolved.deny_hosts.clone().unwrap_or_else(|| {
-        DENY_HOSTS_DEFAULT
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
-    })
 }
 
 /// Write one `<index>.cbor` per verified item into `dir`, returning the count.
@@ -1064,6 +1062,7 @@ mod tests {
             blockfrost: None,
             arweave_gateway: vec![],
             deny_host: vec![],
+            deny_hosts_replace: false,
             out: Some(out.to_string()),
             cbor_dir: None,
             json: false,

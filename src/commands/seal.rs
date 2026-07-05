@@ -1,8 +1,18 @@
-//! `cardanowall seal` — publish a sealed PoE: encrypt a file to one or more
-//! recipients and anchor the proof on Cardano. The plaintext NEVER leaves the
-//! machine — only its hash goes on-chain and only the ciphertext goes to
-//! storage; recipients discover and decrypt it with their own keys (the
-//! `inbox` commands, the web Inbox, or any Label 309 tool).
+//! `cardanowall seal` — publish a sealed PoE: encrypt one or more files to a
+//! shared recipient set and anchor the proof on Cardano. The plaintext NEVER
+//! leaves the machine — only its hash goes on-chain and only the ciphertext
+//! goes to storage; recipients discover and decrypt it with their own keys
+//! (the `inbox` commands, the web Inbox, or any Label 309 tool).
+//!
+//! ## Items
+//!
+//! `--file` is repeatable: each file becomes one item of a single record —
+//! one anchor, one debit, every item sealed to the same recipients under one
+//! KEM. The flow is two-phase inside: every item is encrypted up front (pure,
+//! offline), then one online pass quotes, uploads each ciphertext, and
+//! publishes. A failure after any completed upload lists the finished
+//! uploads — storage URI, byte count, ciphertext hash — in the error, because
+//! that storage work was already paid for.
 //!
 //! ## Recipients
 //!
@@ -18,8 +28,9 @@
 //! when sealing only to yourself, matching the product default).
 //!
 //! Capacity is bounded by the on-chain record budget: roughly 144 classical
-//! or 11 hybrid recipients fit one record under the reference gateway's
-//! record cap; an over-capacity recipient set is refused before any quote or
+//! or 11 hybrid recipient slots fit a one-item record under the reference
+//! gateway's record cap, and every additional item spends its own share of
+//! the same budget; an over-capacity shape is refused before any quote or
 //! upload.
 //!
 //! ## Authorship
@@ -39,8 +50,8 @@
 //! elapsed while waiting (outputs still written) / `4` CLI input error.
 
 use cardanowall::client::{
-    Label309Client, Label309ClientConfig, PublishResponse, PublishSealedInput, QuoteInput,
-    SealedKemChoice, Signer,
+    seal_prepare, Label309Client, Label309ClientConfig, PreparedSeal, SealPrepareInput,
+    SealPrepareItem, SealedKemChoice, Signer, SubmitSealedError, SubmitSealedInput,
 };
 use cardanowall::estimate::{ItemShape, RecordShape, MAX_RECORD_BYTES};
 use cardanowall::hash::sha256;
@@ -54,18 +65,14 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::commands::publish_common::{
-    arweave_uri_placeholder, enforce_max_usd, map_client_error, map_publish_error,
-    resolve_required_gateway, wait_for_poe_target, GatewayArgs, WaitOutcome, WaitTargetArg,
+    arweave_uri_placeholder, map_publish_error, resolve_required_gateway, wait_for_poe_target,
+    GatewayArgs, WaitOutcome, WaitTargetArg,
 };
 use crate::secret::{resolve_secret_bytes, SecretArgs, SecretKind, SystemSecretEnv};
 use crate::util::{bytes_to_hex, format_usd_micros, parse_usd_to_micros, CliError};
 
 /// The seal receipt format literal.
 const RECEIPT_FORMAT: &str = "label-309-seal-receipt-v1";
-/// STREAM chunking constants pinned by the sealed-content format: 64 KiB
-/// plaintext per chunk, a 16-byte Poly1305 tag per chunk.
-const STREAM_CHUNK_BYTES: u64 = 65536;
-const STREAM_TAG_BYTES: u64 = 16;
 
 /// Arguments for `cardanowall seal`.
 ///
@@ -73,10 +80,12 @@ const STREAM_TAG_BYTES: u64 = 16;
 /// secret material, so `Debug` is hand-written to redact both.
 #[derive(Args)]
 pub struct SealArgs {
-    /// the plaintext file: hashed (the on-chain claim) AND encrypted (the
-    /// stored ciphertext). Never uploaded in the clear.
-    #[arg(long)]
-    pub file: String,
+    /// a plaintext file to seal (repeatable: each file becomes one item of a
+    /// single record, sealed to the same recipients). Hashed (the on-chain
+    /// claim) AND encrypted (the stored ciphertext); never uploaded in the
+    /// clear.
+    #[arg(long, value_name = "PATH", required = true)]
+    pub file: Vec<String>,
     /// recipient (repeatable): an `age1…` X25519 or `age1pqc…` X-Wing
     /// recipient string. All recipients of one seal must share one KEM.
     #[arg(long = "to", value_name = "AGE-RECIPIENT", num_args = 1..)]
@@ -195,19 +204,6 @@ impl RecipientSet {
     }
 }
 
-/// The exact ciphertext length the sealed-content STREAM format produces for
-/// a plaintext of `plaintext_len` bytes: one 16-byte tag per 64 KiB chunk,
-/// and an empty plaintext is exactly one (empty) chunk. Feeds the quote's
-/// `file_bytes_total` before any encryption happens.
-fn sealed_ciphertext_len(plaintext_len: u64) -> u64 {
-    let chunks = if plaintext_len == 0 {
-        1
-    } else {
-        plaintext_len.div_ceil(STREAM_CHUNK_BYTES)
-    };
-    plaintext_len + STREAM_TAG_BYTES * chunks
-}
-
 /// Parse and resolve the recipient set: `--to` strings (KEM by prefix, mixing
 /// refused per the standard's MUST NOT) plus the optional self slot, all
 /// deduplicated by raw public key.
@@ -270,16 +266,22 @@ fn resolve_recipients(args: &SealArgs, seed: Option<&[u8; 32]>) -> Result<Recipi
     })
 }
 
-/// The pre-quote capacity gate: the record's estimated canonical size must
-/// fit the on-chain budget, or the recipient set can never publish.
-fn enforce_capacity(recipients: &RecipientSet, signed: bool) -> Result<u64, CliError> {
+/// The pre-quote capacity gate: the record's estimated canonical size — one
+/// item per file, each carrying a full slot set for the recipient list — must
+/// fit the on-chain budget, or the shape can never publish.
+fn enforce_capacity(
+    recipients: &RecipientSet,
+    item_count: usize,
+    signed: bool,
+) -> Result<u64, CliError> {
+    let item = ItemShape {
+        hash_algs: vec!["sha2-256".to_string()],
+        uris: vec![arweave_uri_placeholder()],
+        recipient_count: recipients.keys.len() as u64,
+        kem: Some(recipients.sealed_kem()),
+    };
     let shape = RecordShape {
-        items: vec![ItemShape {
-            hash_algs: vec!["sha2-256".to_string()],
-            uris: vec![arweave_uri_placeholder()],
-            recipient_count: recipients.keys.len() as u64,
-            kem: Some(recipients.sealed_kem()),
-        }],
+        items: vec![item; item_count],
         signed,
         supersedes: false,
         merkle: None,
@@ -287,9 +289,10 @@ fn enforce_capacity(recipients: &RecipientSet, signed: bool) -> Result<u64, CliE
     let estimate = shape.estimate_record_bytes();
     if estimate > MAX_RECORD_BYTES {
         return Err(CliError::input(format!(
-            "seal: {} recipients do not fit one record (estimated {estimate} bytes, budget \
-             {MAX_RECORD_BYTES}) — roughly 144 classical (age1…) or 11 hybrid (age1pqc…) \
-             recipients fit; split the recipient set across records",
+            "seal: {item_count} item(s) × {} recipient(s) do not fit one record (estimated \
+             {estimate} bytes, budget {MAX_RECORD_BYTES}) — roughly 144 classical (age1…) or \
+             11 hybrid (age1pqc…) recipient slots fit a one-item record, and every extra item \
+             spends its own share; split the files or the recipient set across records",
             recipients.keys.len()
         )));
     }
@@ -321,8 +324,7 @@ struct SealReceiptSealed {
 #[derive(Debug, Serialize)]
 struct SealReceiptItem {
     sha2_256: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ar_uri: Option<String>,
+    ar_uri: String,
     ciphertext_bytes: u64,
 }
 
@@ -341,11 +343,15 @@ struct SealReceiptWait {
 /// The versioned seal receipt (`label-309-seal-receipt-v1`). NEVER carries
 /// key material, recipients' addresses, or the plaintext — only the public
 /// facts of the anchor (the signer public key is, by definition, public).
+/// `items` holds one entry per sealed file, in input order; `record_hex` is
+/// the exact canonical-CBOR record that was published, for byte-for-byte
+/// comparison against the on-chain metadata.
 #[derive(Debug, Serialize)]
 struct SealReceipt {
     format: &'static str,
     sealed: SealReceiptSealed,
-    item: SealReceiptItem,
+    items: Vec<SealReceiptItem>,
+    record_hex: String,
     signed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     signer_ed25519: Option<String>,
@@ -358,15 +364,23 @@ struct SealReceipt {
     balance_after_usd_micros: String,
 }
 
+/// One sealed file in the stdout summary, in input order. Unlike the
+/// portable receipt this names the local path, so scripts can map results
+/// back to their inputs.
+#[derive(Debug, Serialize)]
+struct SealOutcomeItem {
+    file: String,
+    sha2_256: String,
+    ar_uri: String,
+}
+
 /// The machine-readable stdout summary (`--json`).
 #[derive(Debug, Serialize)]
 struct SealOutcome {
     id: String,
     tx_hash: Option<String>,
     status: String,
-    sha2_256: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ar_uri: Option<String>,
+    items: Vec<SealOutcomeItem>,
     recipient_count: u64,
     kem: &'static str,
     signed: bool,
@@ -392,9 +406,11 @@ fn emit_outcome(outcome: &SealOutcome, json: bool) {
         "  tx_hash:     {}",
         outcome.tx_hash.as_deref().unwrap_or("<pending>")
     );
-    println!("  sha2_256:    {}", outcome.sha2_256);
-    if let Some(uri) = &outcome.ar_uri {
-        println!("  ar_uri:      {uri}");
+    let total = outcome.items.len();
+    for (index, item) in outcome.items.iter().enumerate() {
+        println!("  item {}/{total}:    {}", index + 1, item.file);
+        println!("    sha2_256:  {}", item.sha2_256);
+        println!("    ar_uri:    {}", item.ar_uri);
     }
     println!(
         "  sealed to:   {} recipient(s), {}",
@@ -411,6 +427,42 @@ fn emit_outcome(outcome: &SealOutcome, json: bool) {
     if let Some(path) = &outcome.receipt_path {
         println!("  receipt:     {path}");
     }
+}
+
+/// Map a two-phase submit failure onto the exit-code contract, listing every
+/// ciphertext upload that had already completed. Storage uploads are paid
+/// work the failure does not refund, so their receipts — file, storage URI,
+/// byte count, ciphertext hash — must reach the user instead of vanishing
+/// with the error (in JSON mode the same text travels inside the structured
+/// error object's `message`).
+fn map_submit_sealed_error(
+    err: SubmitSealedError,
+    files: &[String],
+    prepared: &PreparedSeal,
+) -> CliError {
+    let SubmitSealedError { uploads, source } = err;
+    let mut mapped = map_publish_error("seal", source);
+    if uploads.is_empty() {
+        return mapped;
+    }
+    mapped.message.push_str(&format!(
+        "\nseal: {} ciphertext upload(s) had already completed (paid storage) before the \
+         failure:",
+        uploads.len()
+    ));
+    for receipt in &uploads {
+        let file = prepared
+            .items()
+            .iter()
+            .position(|item| item.item_id() == receipt.item_id)
+            .and_then(|index| files.get(index))
+            .map_or("<item>", String::as_str);
+        mapped.message.push_str(&format!(
+            "\n  {file}: {} ({} bytes, ciphertext sha2-256 {})",
+            receipt.uri, receipt.bytes, receipt.item_id
+        ));
+    }
+    mapped
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +483,14 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
         .as_deref()
         .map(|text| {
             parse_usd_to_micros(text).map_err(|e| CliError::input(format!("seal: --max-usd: {e}")))
+        })
+        .transpose()?;
+    // The SDK's price cap is a u64 of USD micro-cents; anything outside that
+    // range is not a plausible cap for a single publish.
+    let max_usd_micros: Option<u64> = max_usd_micros
+        .map(|value| {
+            u64::try_from(value)
+                .map_err(|_| CliError::input("seal: --max-usd is out of range".to_string()))
         })
         .transpose()?;
 
@@ -463,7 +523,7 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
     }
 
     let recipients = resolve_recipients(&args, seed.as_deref())?;
-    let record_bytes_estimate = enforce_capacity(&recipients, args.sign)?;
+    enforce_capacity(&recipients, args.file.len(), args.sign)?;
 
     let signer: Option<SeedSigner> = if args.sign {
         Some(
@@ -486,9 +546,14 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
         &SystemSecretEnv,
     )?;
 
-    let content = std::fs::read(&args.file)
-        .map_err(|e| CliError::network(format!("seal: cannot read --file {}: {e}", args.file)))?;
-    let plaintext_sha256 = sha256(&content);
+    let mut contents: Vec<Vec<u8>> = Vec::with_capacity(args.file.len());
+    for path in &args.file {
+        contents.push(
+            std::fs::read(path)
+                .map_err(|e| CliError::network(format!("seal: cannot read --file {path}: {e}")))?,
+        );
+    }
+    let plaintext_hashes: Vec<[u8; 32]> = contents.iter().map(|c| sha256(c)).collect();
 
     let gateway_base_url = gateway.base_url.clone();
     let client = Label309Client::new(Label309ClientConfig {
@@ -498,38 +563,30 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
     .map_err(|e| CliError::input(format!("seal: {e}")))?;
     let poe = client.poe();
 
-    // Quote: the record side is the exact-width upper-bound estimate (the
-    // ar:// URI exists only after the ciphertext upload); the storage side is
-    // the exact ciphertext size the STREAM format will produce.
-    let ciphertext_bytes = sealed_ciphertext_len(content.len() as u64);
-    let quote = poe
-        .quote(&QuoteInput {
-            record_bytes: record_bytes_estimate,
-            recipient_count: recipients.keys.len() as u64,
-            file_bytes_total: ciphertext_bytes,
-        })
-        .map_err(|e| map_client_error("seal", e))?;
-    enforce_max_usd("seal", max_usd_micros, &quote)?;
+    // Phase 1 — pure and offline: every file encrypted to the shared
+    // recipient set under one KEM. The plaintext never leaves this process.
+    let prepare_input = SealPrepareInput::new(
+        contents.iter().map(|c| SealPrepareItem::new(c)).collect(),
+        recipients.keys.clone(),
+    )
+    .with_kem(recipients.kem);
+    let prepared = seal_prepare(&prepare_input).map_err(|e| map_publish_error("seal", e.into()))?;
 
-    // Encrypt → upload ciphertext → build the sealed record → publish, all
-    // inside the SDK helper; the plaintext never leaves this process.
-    let response: PublishResponse = poe
-        .publish_sealed(&PublishSealedInput {
-            content,
-            recipients: recipients.keys.clone(),
-            quote_id: quote.quote_id.clone(),
-            hash_alg: None,
-            kem: Some(recipients.kem),
-            signer: signer_ref,
-            idempotency_key: None,
-            chunk_bytes: args.chunk_bytes,
-        })
-        .map_err(|e| map_publish_error("seal", e))?;
-    let ar_uri: Option<String> = response
-        .items
-        .first()
-        .and_then(|item| item.uris.as_ref())
-        .and_then(|uris| uris.first().cloned());
+    // Phase 2 — online: quote (with the --max-usd cap) → per-item ciphertext
+    // upload → refresh a price lock a slow upload outlived → publish. A
+    // failure after any completed upload lists the finished (paid) uploads
+    // in the error.
+    let mut submit_input = SubmitSealedInput::new(&prepared);
+    submit_input.signer = signer_ref;
+    submit_input.max_usd_micros = max_usd_micros;
+    submit_input.chunk_bytes = args.chunk_bytes;
+    let submission = poe
+        .submit_sealed(&submit_input)
+        .map_err(|e| map_submit_sealed_error(e, &args.file, &prepared))?;
+    let quote = submission.quote;
+    let response = submission.response;
+    let record_hex = bytes_to_hex(&submission.record_bytes);
+    let uris = submission.uris;
 
     let wait_result = wait_for_poe_target(&client, &response.id, args.wait, args.timeout, "seal")?;
     let (wait_snapshot, timed_out) = match wait_result {
@@ -549,6 +606,16 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
     }
 
     if let Some(receipt_path) = &args.receipt_out {
+        let items: Vec<SealReceiptItem> = plaintext_hashes
+            .iter()
+            .zip(&uris)
+            .zip(prepared.items())
+            .map(|((hash, uri), item)| SealReceiptItem {
+                sha2_256: bytes_to_hex(hash),
+                ar_uri: uri.clone(),
+                ciphertext_bytes: item.ciphertext().len() as u64,
+            })
+            .collect();
         let receipt = SealReceipt {
             format: RECEIPT_FORMAT,
             sealed: SealReceiptSealed {
@@ -556,11 +623,8 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
                 kem: recipients.kem_id(),
                 to_self: recipients.to_self,
             },
-            item: SealReceiptItem {
-                sha2_256: bytes_to_hex(&plaintext_sha256),
-                ar_uri: ar_uri.clone(),
-                ciphertext_bytes,
-            },
+            items,
+            record_hex: record_hex.clone(),
             signed: signer_pubkey_hex.is_some(),
             signer_ed25519: signer_pubkey_hex.clone(),
             poe_id: response.id.clone(),
@@ -596,8 +660,17 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
         id: response.id.clone(),
         tx_hash,
         status: status.clone(),
-        sha2_256: bytes_to_hex(&plaintext_sha256),
-        ar_uri,
+        items: args
+            .file
+            .iter()
+            .zip(&plaintext_hashes)
+            .zip(&uris)
+            .map(|((file, hash), uri)| SealOutcomeItem {
+                file: file.clone(),
+                sha2_256: bytes_to_hex(hash),
+                ar_uri: uri.clone(),
+            })
+            .collect(),
         recipient_count: recipients.keys.len() as u64,
         kem: recipients.kem_id(),
         signed: signer_pubkey_hex.is_some(),
@@ -627,12 +700,10 @@ pub fn run(args: SealArgs) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cardanowall::sealed_poe::{ecies_sealed_poe_wrap_secure, WrapArgs};
-    use std::collections::BTreeMap;
 
     fn base_args() -> SealArgs {
         SealArgs {
-            file: "/nonexistent".to_string(),
+            file: vec!["/nonexistent".to_string()],
             to: vec![],
             to_self: false,
             sign: false,
@@ -670,33 +741,6 @@ mod tests {
             .unwrap()
             .public_key;
         age_recipient(RecipientKem::MlKem768X25519, &key)
-    }
-
-    /// The ciphertext-size formula must match the real STREAM output exactly —
-    /// the quote's `file_bytes_total` is priced from it before encryption.
-    #[test]
-    fn ciphertext_length_formula_matches_the_real_wrap() {
-        let recipient = derive_x25519_keypair(&[9u8; 32])
-            .unwrap()
-            .public_key
-            .to_vec();
-        for len in [0usize, 1, 65535, 65536, 65537, 150_000] {
-            let plaintext = vec![0x5au8; len];
-            let hashes: BTreeMap<String, Vec<u8>> =
-                [("sha2-256".to_string(), sha256(&plaintext).to_vec())].into();
-            let sealed = ecies_sealed_poe_wrap_secure(WrapArgs {
-                plaintext: &plaintext,
-                recipient_public_keys: std::slice::from_ref(&recipient),
-                hashes: &hashes,
-                ..WrapArgs::default()
-            })
-            .unwrap();
-            assert_eq!(
-                sealed.ciphertext.len() as u64,
-                sealed_ciphertext_len(len as u64),
-                "formula must match the real ciphertext for plaintext len {len}"
-            );
-        }
     }
 
     #[test]
@@ -781,34 +825,59 @@ mod tests {
 
     #[test]
     fn capacity_gate_refuses_oversized_hybrid_sets_before_any_network() {
-        // 11 hybrid recipients fit (even signed); 12 exceed the budget.
+        // 11 hybrid recipients fit a one-item record (even signed); 12 exceed
+        // the budget.
         let fits = RecipientSet {
             kem: SealedKemChoice::Mlkem768X25519,
             keys: vec![vec![0u8; 1216]; 11],
             to_self: false,
         };
-        enforce_capacity(&fits, true).unwrap();
+        enforce_capacity(&fits, 1, true).unwrap();
         let too_many = RecipientSet {
             kem: SealedKemChoice::Mlkem768X25519,
             keys: vec![vec![0u8; 1216]; 12],
             to_self: false,
         };
-        let err = enforce_capacity(&too_many, false).unwrap_err();
+        let err = enforce_capacity(&too_many, 1, false).unwrap_err();
         assert_eq!(err.code, 4);
-        assert!(err.message.contains("recipients"), "{}", err.message);
+        assert!(err.message.contains("recipient"), "{}", err.message);
         // Classical capacity is far higher: 144 fit even signed.
         let classical = RecipientSet {
             kem: SealedKemChoice::X25519,
             keys: vec![vec![0u8; 32]; 144],
             to_self: false,
         };
-        enforce_capacity(&classical, true).unwrap();
+        enforce_capacity(&classical, 1, true).unwrap();
         let classical_over = RecipientSet {
             kem: SealedKemChoice::X25519,
             keys: vec![vec![0u8; 32]; 160],
             to_self: false,
         };
-        assert_eq!(enforce_capacity(&classical_over, true).unwrap_err().code, 4);
+        assert_eq!(
+            enforce_capacity(&classical_over, 1, true).unwrap_err().code,
+            4
+        );
+    }
+
+    #[test]
+    fn capacity_gate_charges_every_item_a_full_slot_set() {
+        // Each item repeats the whole recipient slot set, so the budget is
+        // spent per item × per recipient: 2 items × 5 hybrid slots fit, while
+        // 4 items × 3 hybrid slots (12 in total) do not.
+        let five = RecipientSet {
+            kem: SealedKemChoice::Mlkem768X25519,
+            keys: vec![vec![0u8; 1216]; 5],
+            to_self: false,
+        };
+        enforce_capacity(&five, 2, true).unwrap();
+        let three = RecipientSet {
+            kem: SealedKemChoice::Mlkem768X25519,
+            keys: vec![vec![0u8; 1216]; 3],
+            to_self: false,
+        };
+        let err = enforce_capacity(&three, 4, false).unwrap_err();
+        assert_eq!(err.code, 4);
+        assert!(err.message.contains("item"), "{}", err.message);
     }
 
     #[test]

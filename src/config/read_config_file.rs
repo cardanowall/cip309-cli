@@ -95,9 +95,13 @@ pub struct CardanoWallConfig {
     /// Confirmation-depth threshold.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub confirmation_depth_threshold: Option<i64>,
-    /// Extra deny-host patterns.
+    /// Extra deny-host patterns (appended to the built-in egress deny list).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub deny_host: Option<Vec<String>>,
+    /// Make the `deny_host` entries REPLACE the built-in egress deny list
+    /// instead of appending to it (replacing with none disables the list).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub deny_hosts_replace: Option<bool>,
     /// The active service-gateway profile name (`gateway use <name>`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub default_gateway: Option<String>,
@@ -122,6 +126,7 @@ impl std::fmt::Debug for CardanoWallConfig {
                 &self.confirmation_depth_threshold,
             )
             .field("deny_host", &self.deny_host)
+            .field("deny_hosts_replace", &self.deny_hosts_replace)
             .field("default_gateway", &self.default_gateway)
             // Each profile redacts its own api_key via GatewayProfile::Debug.
             .field("gateways", &self.gateways)
@@ -311,13 +316,14 @@ fn sanitized_toml_location(error: &toml::de::Error, source: &str) -> String {
     }
 }
 
-const KNOWN_KEYS: [&str; 8] = [
+const KNOWN_KEYS: [&str; 9] = [
     "cardano_gateway",
     "blockfrost_project_id",
     "arweave_gateway",
     "ipfs_gateway",
     "confirmation_depth_threshold",
     "deny_host",
+    "deny_hosts_replace",
     "default_gateway",
     "gateways",
 ];

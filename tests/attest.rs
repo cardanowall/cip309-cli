@@ -331,6 +331,54 @@ fn attest_quotes_merkle_records_as_an_upper_bound_with_exact_storage_bytes() {
     assert_eq!(stub.requests_to("/poe/uploads").len(), 1);
 }
 
+/// The full-tree leaves-list upload is billed and lands before the record that
+/// names its `ar://` URI is published. Keying that upload on the leaves-list
+/// content means a crash between the paid upload and the publish re-sends the
+/// SAME `Idempotency-Key` on retry, so the gateway dedups the storage charge
+/// instead of billing it twice. The key is `merkle1-` + the first 32 hex digits
+/// of `sha256(leaves_list)` — the same scheme `submit --merkle` uses.
+#[test]
+fn attest_full_tree_upload_sends_a_content_derived_idempotency_key() {
+    let leaves: Vec<[u8; 32]> = (0u8..3).map(|i| sha256(&[i])).collect();
+    let root = merkle_root(&leaves).unwrap();
+    let leaves_list = encode_leaves_list(&leaves, &root, None).unwrap();
+    let expected_key = format!("merkle1-{}", &hex::encode(sha256(&leaves_list))[..32]);
+
+    // A whole independent run: fresh isolated home + stub, the leaves-list
+    // uploaded once, returning the key that upload carried.
+    let upload_key = || -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = StubGateway::start(StubConfig::default());
+        let mut cmd = cli(&stub, dir.path());
+        cmd.args(["attest", "--json"]);
+        for leaf in &leaves {
+            cmd.args(["--leaf", &hex::encode(leaf)]);
+        }
+        let out = cmd.output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "attest failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let uploads = stub.requests_to("/poe/uploads");
+        assert_eq!(
+            uploads.len(),
+            1,
+            "full-tree mode uploads the leaves-list once"
+        );
+        uploads[0]
+            .header("idempotency-key")
+            .expect("the leaves-list upload carries an idempotency key")
+            .to_string()
+    };
+
+    // The key matches the content-derived scheme, and a second, independent run
+    // (a retry) derives the identical key from the same batch.
+    assert_eq!(upload_key(), expected_key);
+    assert_eq!(upload_key(), expected_key);
+}
+
 // ---------------------------------------------------------------------------
 // 5. Idempotency: auto = no header (content dedup); explicit = strict contract
 // ---------------------------------------------------------------------------
@@ -885,6 +933,142 @@ fn submit_merkle_quote_covers_the_actual_record_and_storage_bytes() {
         quote_body["file_bytes_total"].as_u64().unwrap(),
         leaves_list.len() as u64
     );
+}
+
+/// `submit --file --store` uploads the plaintext content (billed) before it
+/// publishes the record that binds the returned `ar://` URI. That upload
+/// carries a deterministic `Idempotency-Key` — `content1-` + the first 32 hex
+/// digits of `sha256(content)` — so a crash between the paid upload and the
+/// publish re-sends the same key on retry and the gateway dedups the storage
+/// charge instead of billing it twice.
+#[test]
+fn submit_file_store_upload_sends_a_content_derived_idempotency_key() {
+    let outer = tempfile::tempdir().unwrap();
+    let content: &[u8] = b"the quick brown fox jumps over the lazy dog";
+    let content_file = outer.path().join("payload.bin");
+    std::fs::write(&content_file, content).unwrap();
+    let expected_key = format!("content1-{}", &hex::encode(sha256(content))[..32]);
+
+    // A whole independent run: fresh isolated home + stub, the content uploaded
+    // once, returning the key that upload carried.
+    let upload_key = || -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = StubGateway::start(StubConfig::default());
+        let out = cli(&stub, dir.path())
+            .args([
+                "submit",
+                "--file",
+                content_file.to_str().unwrap(),
+                "--store",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "submit --file --store failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let uploads = stub.requests_to("/poe/uploads");
+        assert_eq!(uploads.len(), 1, "--store uploads the content once");
+        uploads[0]
+            .header("idempotency-key")
+            .expect("the content upload carries an idempotency key")
+            .to_string()
+    };
+
+    // The key matches the content-derived scheme, and a second, independent run
+    // (a retry) derives the identical key from the same content.
+    assert_eq!(upload_key(), expected_key);
+    assert_eq!(upload_key(), expected_key);
+}
+
+/// `merkle build --leaf-alg` → `submit --merkle <artifact>`: the advisory
+/// `leaf_alg` recorded offline travels byte-for-byte into the uploaded
+/// leaves-list, the record anchors the same root, and the outcome archives
+/// the exact published record bytes.
+#[test]
+fn submit_merkle_artifact_carries_leaf_alg_into_the_uploaded_list_and_record() {
+    use cardanowall::merkle::decode_leaves_list;
+    use common::stub_gateway::multipart_file_bytes;
+
+    let dir = tempfile::tempdir().unwrap();
+    let leaves: Vec<[u8; 32]> = (0u8..3).map(|i| sha256(&[0x60 + i])).collect();
+    let digests_file = dir.path().join("digests.txt");
+    std::fs::write(
+        &digests_file,
+        leaves
+            .iter()
+            .map(|l| format!("{}\n", hex::encode(l)))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    // The offline build records the leaf_alg claim in the artifact.
+    let stub = StubGateway::start(StubConfig::default());
+    let build = cli(&stub, dir.path())
+        .args([
+            "merkle",
+            "build",
+            "--in",
+            digests_file.to_str().unwrap(),
+            "--leaf-alg",
+            "sha2-256",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        build.status.code(),
+        Some(0),
+        "merkle build failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let built: serde_json::Value = serde_json::from_slice(&build.stdout).unwrap();
+    let artifact_hex = built["leaves_list_cbor_hex"].as_str().unwrap().to_string();
+    let artifact_file = dir.path().join("leaves-list.hex");
+    std::fs::write(&artifact_file, &artifact_hex).unwrap();
+
+    let out = cli(&stub, dir.path())
+        .args([
+            "submit",
+            "--merkle",
+            artifact_file.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "submit --merkle artifact failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The uploaded leaves-list is byte-identical to the built artifact —
+    // leaf_alg included — and decodes back to the same claim.
+    let uploads = stub.requests_to("/poe/uploads");
+    assert_eq!(uploads.len(), 1);
+    let uploaded = multipart_file_bytes(&uploads[0]);
+    assert_eq!(uploaded, hex::decode(&artifact_hex).unwrap());
+    let decoded = decode_leaves_list(&uploaded).unwrap();
+    assert_eq!(decoded.leaf_alg.as_deref(), Some("sha2-256"));
+    assert_eq!(decoded.leaves.len(), 3);
+
+    // The record anchors the artifact's root, and the outcome archives the
+    // exact record bytes that were published.
+    let (record_bytes, record) = captured_record(&stub);
+    let root = merkle_root(&leaves).unwrap();
+    let merkle = record.merkle.expect("merkle[] present");
+    assert_eq!(merkle[0].root, root.to_vec());
+    assert_eq!(merkle[0].leaf_count, 3);
+    let outcome: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        outcome["record_hex"].as_str().unwrap(),
+        hex::encode(&record_bytes)
+    );
+    assert_eq!(outcome["root"].as_str().unwrap(), hex::encode(root));
 }
 
 // ---------------------------------------------------------------------------

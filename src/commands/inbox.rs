@@ -40,7 +40,7 @@ use cardanowall::sealed_poe::{
 use cardanowall::verifier::content::{
     provider_mismatch_path, walk_blob_sources, BlobWalkEnd, SourceDecision,
 };
-use cardanowall::verifier::fetch::{ReqwestTransport, DENY_HOSTS_DEFAULT};
+use cardanowall::verifier::fetch::ReqwestTransport;
 use cardanowall::verifier::{
     extract_label_309_metadata, resolve_cardano_tx, ContentFetchPolicy, GatewayFetcher,
     VerifierIssue, CONFIRMATION_DEPTH_THRESHOLD_DEFAULT,
@@ -411,10 +411,15 @@ pub struct InboxListArgs {
     /// Blockfrost project id (enables Blockfrost fallback).
     #[arg(long)]
     pub blockfrost: Option<String>,
-    /// replaces the built-in egress deny list (repeatable): the listed hosts
-    /// become the only refused ones — you take over SSRF protection.
+    /// extra entries for the egress deny list (repeatable), appended to the
+    /// built-in defaults. Applies to URLs taken from on-chain records.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
+    /// the --deny-host entries REPLACE the built-in deny list instead of
+    /// appending. With no entries listed, NOTHING is refused — you take over
+    /// SSRF protection entirely.
+    #[arg(long = "deny-hosts-replace")]
+    pub deny_hosts_replace: bool,
     /// The identity source (seed or X25519 secret key; raw / file / stdin / env).
     #[command(flatten)]
     pub identity: crate::inbox::IdentitySource,
@@ -435,6 +440,7 @@ impl std::fmt::Debug for InboxListArgs {
                 &self.blockfrost.as_ref().map(|_| "[redacted]"),
             )
             .field("deny_host", &self.deny_host)
+            .field("deny_hosts_replace", &self.deny_hosts_replace)
             .field("identity", &self.identity)
             .field("json", &self.json)
             .field("pretty", &self.pretty)
@@ -482,14 +488,14 @@ fn run_list(args: InboxListArgs) -> Result<(), CliError> {
             gateway: args.gateway.clone(),
             blockfrost: args.blockfrost.clone(),
             deny_host: args.deny_host.clone(),
+            deny_hosts_replace: args.deny_hosts_replace,
             ..GatewayFlags::default()
         };
         let resolved = resolve_gateways_for(flags, "inbox list")?;
-        let deny_hosts = deny_hosts_or_default(&resolved);
         // The transport carries the deny list so its redirect-policy closure
         // re-applies the same list the fetcher's initial-URL guard uses.
-        let transport = ReqwestTransport::with_deny_hosts(deny_hosts.clone());
-        let mut fetcher = GatewayFetcher::new(&transport, Some(&deny_hosts));
+        let transport = ReqwestTransport::with_deny_hosts(resolved.deny_hosts.clone());
+        let mut fetcher = GatewayFetcher::new(&transport, Some(&resolved.deny_hosts));
         let mut refreshed = HashMap::new();
         let unique: Vec<String> = {
             let mut seen = std::collections::HashSet::new();
@@ -615,10 +621,15 @@ pub struct InboxDecryptArgs {
     /// IPFS gateway URL (repeatable).
     #[arg(long = "ipfs-gateway")]
     pub ipfs_gateway: Vec<String>,
-    /// replaces the built-in egress deny list (repeatable): the listed hosts
-    /// become the only refused ones — you take over SSRF protection.
+    /// extra entries for the egress deny list (repeatable), appended to the
+    /// built-in defaults. Applies to URLs taken from on-chain records.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
+    /// the --deny-host entries REPLACE the built-in deny list instead of
+    /// appending. With no entries listed, NOTHING is refused — you take over
+    /// SSRF protection entirely.
+    #[arg(long = "deny-hosts-replace")]
+    pub deny_hosts_replace: bool,
     /// The identity source (seed or X25519 secret key; raw / file / stdin / env).
     #[command(flatten)]
     pub identity: crate::inbox::IdentitySource,
@@ -648,6 +659,7 @@ impl std::fmt::Debug for InboxDecryptArgs {
             .field("arweave_gateway", &self.arweave_gateway)
             .field("ipfs_gateway", &self.ipfs_gateway)
             .field("deny_host", &self.deny_host)
+            .field("deny_hosts_replace", &self.deny_hosts_replace)
             .field("identity", &self.identity)
             .field("json", &self.json)
             .field("pretty", &self.pretty)
@@ -692,14 +704,14 @@ fn run_decrypt(args: InboxDecryptArgs) -> Result<(), CliError> {
         arweave_gateway: args.arweave_gateway.clone(),
         ipfs_gateway: args.ipfs_gateway.clone(),
         deny_host: args.deny_host.clone(),
+        deny_hosts_replace: args.deny_hosts_replace,
         ..GatewayFlags::default()
     };
     let resolved = resolve_gateways_for(flags, "inbox decrypt")?;
-    let deny_hosts = deny_hosts_or_default(&resolved);
     // The transport carries the deny list so its redirect-policy closure
     // re-applies the same list the fetcher's initial-URL guard uses.
-    let transport = ReqwestTransport::with_deny_hosts(deny_hosts.clone());
-    let mut fetcher = GatewayFetcher::new(&transport, Some(&deny_hosts));
+    let transport = ReqwestTransport::with_deny_hosts(resolved.deny_hosts.clone());
+    let mut fetcher = GatewayFetcher::new(&transport, Some(&resolved.deny_hosts));
 
     let metadata = fetch_metadata(&tx_hash, &args, &resolved, &mut fetcher)?;
     // The recipient reading: an envelope this implementation cannot fully
@@ -1128,15 +1140,6 @@ fn fail_result(tx_hash: &str, idx: usize, reason: &str) -> DecryptItemResult {
     }
 }
 
-fn deny_hosts_or_default(resolved: &ResolvedGateways) -> Vec<String> {
-    resolved.deny_hosts.clone().unwrap_or_else(|| {
-        DENY_HOSTS_DEFAULT
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
-    })
-}
-
 fn map_inbox_client_error(err: ClientError, cmd: &str) -> CliError {
     match err {
         ClientError::Http(http) => {
@@ -1223,6 +1226,7 @@ mod tests {
             arweave_gateway: vec![],
             ipfs_gateway: vec![],
             deny_host: vec![],
+            deny_hosts_replace: false,
             identity: seed_source(Some(&"00".repeat(32)), None),
             json: false,
             pretty: false,
@@ -1236,6 +1240,7 @@ mod tests {
             gateway: vec![],
             blockfrost: None,
             deny_host: vec![],
+            deny_hosts_replace: false,
             identity: seed_source(None, Some(&"ab".repeat(32))),
             json: false,
             pretty: false,
@@ -1267,6 +1272,7 @@ mod tests {
             gateway: vec!["https://koios.example".to_string()],
             blockfrost: Some("mainnetSECRETprojectid".to_string()),
             deny_host: vec![],
+            deny_hosts_replace: false,
             identity: seed_source(Some(&"ab".repeat(32)), None),
             json: false,
             pretty: false,
@@ -1292,6 +1298,7 @@ mod tests {
             arweave_gateway: vec![],
             ipfs_gateway: vec![],
             deny_host: vec![],
+            deny_hosts_replace: false,
             identity: seed_source(None, Some(&"cd".repeat(32))),
             json: false,
             pretty: false,

@@ -11,7 +11,6 @@
 //! validates the record, and runs the profile-gated signature / decryption /
 //! Merkle checks — trusting no publisher and no issuer server.
 
-use cardanowall::verifier::fetch::DENY_HOSTS_DEFAULT;
 use cardanowall::verifier::{
     verify_report_to_dict, verify_tx, Decryption, Profile, VerifyTxInput,
     CONFIRMATION_DEPTH_THRESHOLD_DEFAULT,
@@ -60,11 +59,19 @@ pub struct VerifyArgs {
     /// CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD).
     #[arg(long)]
     pub threshold: Option<String>,
-    /// REPLACES the built-in egress deny list (repeatable; or env
-    /// CARDANOWALL_DENY_HOST): when set, only the hosts you list are refused —
-    /// you take over SSRF protection. Meant for loopback/dev gateways.
+    /// extra entries for the egress deny list (repeatable; or env
+    /// CARDANOWALL_DENY_HOST), appended to the built-in defaults. Applies only
+    /// to URLs derived from untrusted on-chain records — the record URIs and the
+    /// explorer / Arweave / IPFS resolver hops taken to fetch them.
     #[arg(long = "deny-host")]
     pub deny_host: Vec<String>,
+    /// the --deny-host entries REPLACE the built-in deny list instead of
+    /// appending (or env CARDANOWALL_DENY_HOSTS_REPLACE / config
+    /// deny_hosts_replace). With no entries listed, NOTHING is refused — you
+    /// take over SSRF protection entirely. Meant for private-network
+    /// resolvers (e.g. an internal Arweave mirror, or arlocal on loopback).
+    #[arg(long = "deny-hosts-replace")]
+    pub deny_hosts_replace: bool,
     /// Recipient secret key for sealed PoE, as bare hex (repeatable; tried
     /// against every sealed item). INSECURE on argv; prefer --secret-key-file /
     /// --secret-key-stdin / CARDANOWALL_RECIPIENT_KEY (comma/space-separated for
@@ -106,6 +113,7 @@ impl std::fmt::Debug for VerifyArgs {
             .field("ipfs_gateway", &self.ipfs_gateway)
             .field("threshold", &self.threshold)
             .field("deny_host", &self.deny_host)
+            .field("deny_hosts_replace", &self.deny_hosts_replace)
             // The recipient secret keys are secret material: report only how many
             // were supplied, never the bytes.
             .field(
@@ -277,6 +285,7 @@ pub fn run(args: VerifyArgs) -> Result<(), CliError> {
         ipfs_gateway: args.ipfs_gateway.clone(),
         threshold,
         deny_host: args.deny_host.clone(),
+        deny_hosts_replace: args.deny_hosts_replace,
     };
     let resolved = resolve_gateways(&flags, &SystemGatewayEnv, config.as_ref())?;
     let input = build_verify_input(&args, profile, &resolved, secret_keys);
@@ -306,16 +315,10 @@ fn build_verify_input(
     resolved: &ResolvedGateways,
     secret_keys: Vec<Vec<u8>>,
 ) -> VerifyTxInput<'static> {
-    // SSRF posture: when the user supplies no `--deny-host`, fall back to the
-    // canonical deny-list so a `verify` run can never be coaxed into fetching from
-    // the operator's own host or localhost.
-    let deny_hosts = resolved.deny_hosts.clone().unwrap_or_else(|| {
-        DENY_HOSTS_DEFAULT
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
-    });
-
+    // SSRF posture: the resolver already folded the built-in deny list into
+    // the effective set — user entries only ever extend it, unless replace
+    // mode was chosen explicitly (where an empty set means the user took over
+    // egress policy entirely).
     let mut input = VerifyTxInput::new(args.tx_hash.to_lowercase());
     input.profile = profile;
     input.cardano_gateway_chain = Some(resolved.cardano_gateway_chain.clone());
@@ -327,7 +330,7 @@ fn build_verify_input(
             .confirmation_depth_threshold
             .unwrap_or(CONFIRMATION_DEPTH_THRESHOLD_DEFAULT),
     );
-    input.deny_hosts = Some(deny_hosts);
+    input.deny_hosts = Some(resolved.deny_hosts.clone());
     if !secret_keys.is_empty() {
         input.decryption = Some(
             secret_keys
@@ -383,6 +386,7 @@ mod tests {
             ipfs_gateway: vec![],
             threshold: None,
             deny_host: vec![],
+            deny_hosts_replace: false,
             secret_key: vec![],
             secret_key_file: None,
             secret_key_stdin: false,

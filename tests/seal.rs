@@ -14,7 +14,8 @@ use cardanowall::sealed_poe::{ecies_sealed_poe_unwrap, UnwrapKeys, UnwrapResult}
 use cardanowall::seed_derive::{derive_mlkem768x25519_keypair, derive_x25519_keypair};
 
 use common::stub_gateway::{
-    captured_publish_record, cli, multipart_file_bytes, stub_ar_uri, StubConfig, StubGateway,
+    captured_publish_record, cli, multipart_file_bytes, stub_ar_uri, stub_upload_uri,
+    PublishBehavior, StubConfig, StubGateway,
 };
 
 /// Encode a raw public key as its age recipient string.
@@ -74,7 +75,7 @@ fn seal_uploads_ciphertext_not_plaintext_and_publishes_the_envelope() {
 
     // The record: one item, sha2-256 of the plaintext, the storage URI, and a
     // scheme-1 envelope with one classical slot per recipient.
-    let (_, record) = captured_publish_record(&stub);
+    let (record_bytes, record) = captured_publish_record(&stub);
     let items = record.items.expect("sealed record carries items[]");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].hashes[0].0, "sha2-256");
@@ -97,14 +98,203 @@ fn seal_uploads_ciphertext_not_plaintext_and_publishes_the_envelope() {
         (PLAINTEXT.len() + 16) as u64
     );
 
-    // The receipt names the public facts only.
+    // The receipt names the public facts only, and archives the exact
+    // published record bytes.
     let receipt: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir.path().join("r.json")).unwrap()).unwrap();
     assert_eq!(receipt["format"], "label-309-seal-receipt-v1");
     assert_eq!(receipt["sealed"]["recipient_count"], 2);
     assert_eq!(receipt["sealed"]["kem"], "x25519");
-    assert_eq!(receipt["item"]["ar_uri"].as_str().unwrap(), stub_ar_uri());
+    let receipt_items = receipt["items"].as_array().expect("items[] present");
+    assert_eq!(receipt_items.len(), 1);
+    assert_eq!(receipt_items[0]["ar_uri"].as_str().unwrap(), stub_ar_uri());
+    assert_eq!(
+        receipt_items[0]["sha2_256"].as_str().unwrap(),
+        hex::encode(sha256(PLAINTEXT))
+    );
+    assert_eq!(
+        receipt["record_hex"].as_str().unwrap(),
+        hex::encode(&record_bytes),
+        "the receipt archives the exact published record bytes"
+    );
     assert_eq!(receipt["status"], "confirmed");
+}
+
+#[test]
+fn seal_multiple_files_publishes_one_record_with_one_item_per_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let first: &[u8] = b"first sealed item";
+    let second: &[u8] = b"second sealed item, a little longer";
+    std::fs::write(dir.path().join("a.bin"), first).unwrap();
+    std::fs::write(dir.path().join("b.bin"), second).unwrap();
+    let recipients: Vec<String> = [1u8, 2]
+        .iter()
+        .map(|i| age_recipient("age", &derive_x25519_keypair(&[*i; 32]).unwrap().public_key))
+        .collect();
+
+    let stub = StubGateway::start(StubConfig::default());
+    let out = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "a.bin",
+            "--file",
+            "b.bin",
+            "--to",
+            &recipients[0],
+            "--to",
+            &recipients[1],
+            "--receipt-out",
+            "r.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "multi-file seal failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // One ciphertext upload per file, in input order, each the STREAM size of
+    // its own plaintext.
+    let uploads = stub.requests_to("/poe/uploads");
+    assert_eq!(uploads.len(), 2);
+    assert_eq!(
+        multipart_file_bytes(&uploads[0]).len(),
+        first.len() + 16,
+        "upload 1 carries the first file's ciphertext"
+    );
+    assert_eq!(
+        multipart_file_bytes(&uploads[1]).len(),
+        second.len() + 16,
+        "upload 2 carries the second file's ciphertext"
+    );
+
+    // ONE published record with items[] in input order: each item binds its
+    // own plaintext hash, its own storage URI, and a full recipient slot set.
+    let (record_bytes, record) = captured_publish_record(&stub);
+    let items = record.items.expect("items[] present");
+    assert_eq!(items.len(), 2);
+    for (item, (plaintext, uri)) in items
+        .iter()
+        .zip([(first, stub_upload_uri(1)), (second, stub_upload_uri(2))])
+    {
+        assert_eq!(item.hashes[0].1, sha256(plaintext).to_vec());
+        assert_eq!(item.uris.as_deref(), Some(&[uri][..]));
+        let EncryptionEnvelope::Scheme1(env) = item.enc.as_ref().expect("enc present") else {
+            panic!("expected a scheme-1 envelope");
+        };
+        assert_eq!(env.slots.as_ref().unwrap().len(), 2);
+    }
+
+    // ONE quote priced the whole shape: 2 items × 2 recipients = 4 slots, and
+    // the storage total is the sum of both ciphertexts.
+    let quotes = stub.requests_to("/poe/quote");
+    assert_eq!(quotes.len(), 1, "one quote covers the whole multi-item run");
+    assert_eq!(quotes[0].body_json()["recipient_count"], 4);
+    assert_eq!(
+        quotes[0].body_json()["file_bytes_total"].as_u64().unwrap(),
+        (first.len() + 16 + second.len() + 16) as u64
+    );
+
+    // The receipt carries one entry per item plus the exact record bytes.
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("r.json")).unwrap()).unwrap();
+    let receipt_items = receipt["items"].as_array().unwrap();
+    assert_eq!(receipt_items.len(), 2);
+    for (entry, (plaintext, uri)) in receipt_items
+        .iter()
+        .zip([(first, stub_upload_uri(1)), (second, stub_upload_uri(2))])
+    {
+        assert_eq!(
+            entry["sha2_256"].as_str().unwrap(),
+            hex::encode(sha256(plaintext))
+        );
+        assert_eq!(entry["ar_uri"].as_str().unwrap(), uri);
+        assert_eq!(
+            entry["ciphertext_bytes"].as_u64().unwrap(),
+            (plaintext.len() + 16) as u64
+        );
+    }
+    assert_eq!(
+        receipt["record_hex"].as_str().unwrap(),
+        hex::encode(&record_bytes)
+    );
+
+    // The stdout summary maps every item back to its input file.
+    let outcome: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let outcome_items = outcome["items"].as_array().unwrap();
+    assert_eq!(outcome_items.len(), 2);
+    assert_eq!(outcome_items[0]["file"], "a.bin");
+    assert_eq!(outcome_items[1]["file"], "b.bin");
+    assert_eq!(
+        outcome_items[1]["ar_uri"].as_str().unwrap(),
+        stub_upload_uri(2)
+    );
+}
+
+#[test]
+fn seal_publish_failure_after_paid_uploads_reports_the_completed_uploads() {
+    let scripted = StubConfig {
+        publish: PublishBehavior::Reject,
+        ..StubConfig::default()
+    };
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[4u8; 32]).unwrap().public_key,
+    );
+
+    // Human mode: the gateway rejection is integrity-class (exit 1) and the
+    // diagnostic lists each completed upload — file, storage URI, byte count,
+    // ciphertext hash — because that storage work was already paid for.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.bin"), PLAINTEXT).unwrap();
+    std::fs::write(dir.path().join("b.bin"), PLAINTEXT).unwrap();
+    let stub = StubGateway::start(scripted.clone());
+    let out = cli(&stub, dir.path())
+        .args([
+            "seal", "--file", "a.bin", "--file", "b.bin", "--to", &recipient,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stub.requests_to("/poe/uploads").len(),
+        2,
+        "both uploads completed before the publish was rejected"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("record-rejected"), "stderr: {stderr}");
+    for (file, uri) in [("a.bin", stub_upload_uri(1)), ("b.bin", stub_upload_uri(2))] {
+        assert!(
+            stderr.contains(&format!("{file}: {uri}")),
+            "stderr must list the paid upload for {file}: {stderr}"
+        );
+    }
+
+    // JSON mode: the same diagnostic travels inside the structured error
+    // object, so automation sees the completed uploads too.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.bin"), PLAINTEXT).unwrap();
+    let stub = StubGateway::start(scripted);
+    let out = cli(&stub, dir.path())
+        .args(["seal", "--file", "a.bin", "--to", &recipient, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let error: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&out.stderr).trim())
+            .expect("JSON mode emits a structured error object");
+    assert_eq!(error["error"]["code"], 1);
+    assert_eq!(error["error"]["command"], "seal");
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("a.bin: {}", stub_upload_uri(1))),
+        "message must list the paid upload: {message}"
+    );
+    assert!(out.stdout.is_empty(), "no summary on a failed publish");
 }
 
 #[test]
