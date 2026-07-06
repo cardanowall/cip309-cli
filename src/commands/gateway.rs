@@ -306,6 +306,13 @@ fn run_show(
         return Err(unknown_profile(&args.name, &config));
     };
     let is_default = config.default_gateway.as_deref() == Some(args.name.as_str());
+    // --reveal prints the full API key to stdout (an explicit owner opt-in, key
+    // already plaintext in the config file). Emit a one-line stderr caution when a
+    // key is actually revealed so capturing it in a CI log is a conscious act;
+    // stdout shape is unchanged, in both text and --json paths.
+    if args.reveal && profile.api_key.is_some() {
+        eprintln!("warning: full API key printed to stdout");
+    }
     let key_display = if args.reveal {
         profile.api_key.clone().unwrap_or_default()
     } else {

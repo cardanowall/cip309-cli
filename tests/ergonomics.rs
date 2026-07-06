@@ -92,6 +92,26 @@ fn gateway_profiles_round_trip_with_0600_and_preserved_fields() {
     assert_eq!(prof["has_api_key"], true);
     assert_eq!(prof["is_default"], true);
 
+    // show --reveal prints the full key to stdout AND emits a one-line stderr
+    // caution, so capturing it in a CI log is a conscious act; stdout stays a
+    // parseable JSON object either way.
+    let reveal = cmd(&config, &home)
+        .args(["gateway", "show", "prod", "--reveal", "--json"])
+        .output()
+        .unwrap();
+    assert!(reveal.status.success());
+    let rv: serde_json::Value = serde_json::from_slice(&reveal.stdout).unwrap();
+    assert_eq!(
+        rv["api_key"], "super-secret-key",
+        "--reveal must print the full key on stdout"
+    );
+    let reveal_stderr = String::from_utf8_lossy(&reveal.stderr);
+    assert!(
+        reveal_stderr.to_lowercase().contains("warning")
+            && reveal_stderr.to_lowercase().contains("api key"),
+        "--reveal must emit an stderr caution; got stderr:\n{reveal_stderr}"
+    );
+
     // A second profile, then `use` switches the default.
     let add2 = cmd(&config, &home)
         .args([

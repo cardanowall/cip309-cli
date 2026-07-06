@@ -3,10 +3,16 @@
 //! Wraps the record-building and publish plumbing as one subcommand with four
 //! mutually exclusive modes:
 //!
-//! - `--hash <64-hex>`         anchor precomputed digests (repeatable: one
-//!   `items[i]` per digest; `--alg` applies to all of them)
-//! - `--file <path>`           hash the file contents and anchor the digest;
-//!   add `--store` to also upload the plaintext and bind its `ar://` URI
+//! - `--hash <spec>`           anchor precomputed digests (repeatable: one
+//!   `items[i]` per `--hash`). A spec is a comma-separated list of one or more
+//!   `alg:digest` pairs — co-hashing one item under several algorithms
+//!   (`--hash sha2-256:<hex>,blake2b-256:<hex>`); a bare `<hex>` takes the lone
+//!   `--hash-alg` (default `sha2-256`)
+//! - `--file <path>`           hash the file contents and anchor the digest(s)
+//!   (`--hash-alg` is repeatable, co-hashing the file under each); add
+//!   `--store` to also upload the plaintext and bind its `ar://` URI
+//! - `--uri <ar://|ipfs://>`   attach content-discovery mirrors to every
+//!   `--hash` / `--file` item, independent of `--store` (repeatable)
 //! - `--merkle <leaves-file>`  anchor a Merkle commitment. The file is either
 //!   the canonical leaves-list artifact `merkle build` emits
 //!   (`cardano-poe-merkle-leaves-v1` CBOR, raw bytes or hex text — its
@@ -58,7 +64,6 @@ use cardanowall::client::{
     ResumableSource, ResumableUploadInput, Signer,
 };
 use cardanowall::estimate::{ItemShape, RecordShape};
-use cardanowall::hash::{blake2b256, sha256};
 use cardanowall::merkle::{decode_leaves_list, DecodedLeavesList, MerkleLeavesListError};
 use cardanowall::poe_standard::{
     validate_poe_record, ItemEntry, PoeRecord, ValidateResult, ValidatorOptions,
@@ -68,10 +73,12 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::commands::publish_common::{
-    arweave_uri_placeholder, content_upload_idempotency_key, encode_record_with_signer,
-    enforce_max_usd, map_client_error, map_publish_error, map_upload_error, parse_supersedes,
-    refresh_quote_if_stale, resolve_optional_signer, resolve_required_gateway, wait_for_poe_target,
-    GatewayArgs, WaitOutcome, WaitTargetArg, STORED_CONTENT_UPLOAD_ROLE,
+    arweave_uri_placeholder, cohash_content, content_upload_idempotency_key,
+    encode_record_with_signer, enforce_max_usd, map_client_error, map_publish_error,
+    map_upload_error, parse_cohash_spec, parse_supersedes, refresh_quote_if_stale,
+    resolve_content_hash_algs, resolve_optional_signer, resolve_required_gateway,
+    validate_content_uris, wait_for_poe_target, ContentHashAlg, GatewayArgs, WaitOutcome,
+    WaitTargetArg, STORED_CONTENT_UPLOAD_ROLE,
 };
 use crate::secret::{SecretArgs, SecretEnv, ServiceGateway, SystemSecretEnv};
 use crate::util::{
@@ -81,44 +88,26 @@ use crate::util::{
 /// The storage backend `--store` uploads plaintext content to.
 const STORAGE_TARGET_ARWEAVE: &str = "arweave";
 
-const SHA2_256_DIGEST_BYTES: usize = 32;
-
-/// The hash algorithm surface of `--alg`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HashAlg {
-    Sha2_256,
-    Blake2b256,
-}
-
-impl HashAlg {
-    fn as_str(self) -> &'static str {
-        match self {
-            HashAlg::Sha2_256 => "sha2-256",
-            HashAlg::Blake2b256 => "blake2b-256",
-        }
-    }
-
-    fn digest(self, content: &[u8]) -> [u8; 32] {
-        match self {
-            HashAlg::Sha2_256 => sha256(content),
-            HashAlg::Blake2b256 => blake2b256(content),
-        }
-    }
-}
-
 /// Arguments for `cardanowall submit`.
 /// `seed` (the raw argv identity seed) and `api_key` (the bearer token) are
 /// secret material, so `Debug` is hand-written to redact both: no `{:?}`, log,
 /// or panic-backtrace path can ever surface them.
 #[derive(Args)]
 pub struct SubmitArgs {
-    /// 64-hex precomputed digest (repeatable: N digests publish one record
-    /// with N items[]; --alg applies to all of them; default alg sha2-256).
-    #[arg(long, value_name = "HEX64", num_args = 1..)]
+    /// precomputed digest spec (repeatable: each --hash publishes one items[]).
+    /// A spec is a comma-separated list of `alg:digest` pairs co-hashing one
+    /// item (e.g. `sha2-256:<hex>,blake2b-256:<hex>`); a bare `<hex>` takes the
+    /// lone --hash-alg (default sha2-256).
+    #[arg(long, value_name = "SPEC", num_args = 1..)]
     pub hash: Vec<String>,
     /// path to a file whose contents will be hashed and anchored.
     #[arg(long)]
     pub file: Option<String>,
+    /// content-discovery URI to attach to every item: an already-pinned
+    /// `ar://` / `ipfs://` mirror (repeatable). Independent of --store, which
+    /// uploads the plaintext and binds its own `ar://`.
+    #[arg(long = "uri", value_name = "AR-OR-IPFS-URI")]
+    pub uri: Vec<String>,
     /// with --file: also upload the PLAINTEXT content to storage and bind the
     /// returned ar:// URI into the record (a public attachment).
     #[arg(long)]
@@ -134,12 +123,15 @@ pub struct SubmitArgs {
     /// network call; never re-encoded or re-signed.
     #[arg(long, value_name = "FILE|-")]
     pub record: Option<String>,
-    /// hash algorithm: 'sha2-256' (default) or 'blake2b-256' (--merkle: sha2-256 only).
-    #[arg(long)]
-    pub alg: Option<String>,
+    /// content-hash algorithm (repeatable: co-hash a --file item under each,
+    /// e.g. --hash-alg sha2-256 --hash-alg blake2b-256; also the default alg
+    /// for a bare --hash digest). --merkle accepts sha2-256 only. Default
+    /// sha2-256.
+    #[arg(long = "hash-alg", value_name = "ALG")]
+    pub hash_alg: Vec<String>,
     /// mark this record as superseding an earlier one: the 64-hex Cardano
-    /// transaction hash of the record being replaced (--hash / --file modes;
-    /// a --record carries its own supersedes inside its bytes).
+    /// transaction hash of the record being replaced (--hash / --file / --merkle
+    /// modes; a --record carries its own supersedes inside its bytes).
     #[arg(long = "supersedes", value_name = "TX64")]
     pub supersedes: Option<String>,
     /// refuse to publish when the quoted price exceeds this USD amount
@@ -202,10 +194,11 @@ impl std::fmt::Debug for SubmitArgs {
         f.debug_struct("SubmitArgs")
             .field("hash", &self.hash)
             .field("file", &self.file)
+            .field("uri", &self.uri)
             .field("store", &self.store)
             .field("merkle", &self.merkle)
             .field("record", &self.record)
-            .field("alg", &self.alg)
+            .field("hash_alg", &self.hash_alg)
             .field("supersedes", &self.supersedes)
             .field("max_usd", &self.max_usd)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
@@ -327,22 +320,6 @@ fn choose_mode(args: &SubmitArgs) -> Result<Mode, CliError> {
     }
 }
 
-fn resolve_hash_alg(args: &SubmitArgs) -> Result<HashAlg, CliError> {
-    match args
-        .alg
-        .as_deref()
-        .map(str::to_lowercase)
-        .as_deref()
-        .unwrap_or("sha2-256")
-    {
-        "sha2-256" => Ok(HashAlg::Sha2_256),
-        "blake2b-256" => Ok(HashAlg::Blake2b256),
-        other => Err(CliError::input(format!(
-            "submit: --alg must be 'sha2-256' or 'blake2b-256' (got '{other}')"
-        ))),
-    }
-}
-
 /// Load the `--merkle` leaves input: the leaf set plus the advisory
 /// `leaf_alg` to carry into the uploaded leaves-list.
 ///
@@ -448,27 +425,26 @@ fn emit_outcome(outcome: &SubmitOutcome, json: bool) {
 
 /// The record-shaping inputs the local-build modes share.
 struct BuildInputs<'a> {
-    alg: HashAlg,
     signer: Option<&'a dyn Signer>,
     supersedes: Option<&'a [u8]>,
     idempotency_key: Option<&'a str>,
     max_usd_micros: Option<i128>,
 }
 
-/// Anchor precomputed digests (one `items[i]` per digest): build (and
-/// optionally sign) the exact record first, quote its precise canonical
-/// length, then publish those bytes.
+/// Anchor content items (one `items[i]` per hashes set): build (and optionally
+/// sign) the exact record first, quote its precise canonical length, then
+/// publish those bytes. Each item may carry several co-hash entries.
 fn publish_items(
     poe: &cardanowall::client::PoeNamespace<'_>,
-    digests: Vec<Vec<u8>>,
+    items_hashes: Vec<Vec<(String, Vec<u8>)>>,
     uris: Option<Vec<String>>,
     inputs: &BuildInputs<'_>,
     mode: Mode,
 ) -> Result<SubmitOutcome, CliError> {
-    let items: Vec<ItemEntry> = digests
+    let items: Vec<ItemEntry> = items_hashes
         .into_iter()
-        .map(|digest| ItemEntry {
-            hashes: vec![(inputs.alg.as_str().to_string(), digest)],
+        .map(|hashes| ItemEntry {
+            hashes,
             uris: uris.clone(),
             enc: None,
         })
@@ -538,13 +514,20 @@ fn publish_record_bytes(
 fn publish_stored_file(
     poe: &cardanowall::client::PoeNamespace<'_>,
     content: Vec<u8>,
-    digest: Vec<u8>,
+    hashes: Vec<(String, Vec<u8>)>,
+    mirror_uris: Vec<String>,
     inputs: &BuildInputs<'_>,
 ) -> Result<SubmitOutcome, CliError> {
+    // The record's URIs are the explicit mirrors (known exactly at quote time)
+    // plus the to-be-minted `ar://` placeholder for the upload — the estimate
+    // charges every mirror at its exact width and the upload URI at the
+    // fixed Arweave width, so the quote is an exact upper bound.
+    let mut shape_uris = mirror_uris.clone();
+    shape_uris.push(arweave_uri_placeholder());
     let shape = RecordShape {
         items: vec![ItemShape {
-            hash_algs: vec![inputs.alg.as_str().to_string()],
-            uris: vec![arweave_uri_placeholder()],
+            hash_algs: hashes.iter().map(|(alg, _)| alg.clone()).collect(),
+            uris: shape_uris,
             recipient_count: 0,
             kem: None,
         }],
@@ -571,11 +554,14 @@ fn publish_stored_file(
             ..ResumableUploadInput::default()
         })
         .map_err(|e| map_upload_error("submit", e))?;
+    // The explicit mirrors precede the freshly uploaded `ar://` in the record.
+    let mut uris = mirror_uris;
+    uris.push(upload.uri.clone());
     let record = PoeRecord {
         v: 1,
         items: Some(vec![ItemEntry {
-            hashes: vec![(inputs.alg.as_str().to_string(), digest)],
-            uris: Some(vec![upload.uri.clone()]),
+            hashes,
+            uris: Some(uris),
             enc: None,
         }]),
         supersedes: inputs.supersedes.map(<[u8]>::to_vec),
@@ -616,22 +602,20 @@ fn load_record_bytes(source: &str) -> Result<Vec<u8>, CliError> {
     }
 }
 
-/// Parse the repeatable `--hash` values into raw digests.
-fn parse_hash_digests(values: &[String]) -> Result<Vec<Vec<u8>>, CliError> {
-    let mut digests = Vec::with_capacity(values.len());
-    for value in values {
-        let hex = value.trim().to_lowercase();
-        let digest =
-            hex_to_bytes(&hex).map_err(|e| CliError::input(format!("submit: --hash {e}")))?;
-        if digest.len() != SHA2_256_DIGEST_BYTES {
-            return Err(CliError::input(format!(
-                "submit: --hash must decode to exactly {SHA2_256_DIGEST_BYTES} bytes (got {})",
-                digest.len()
-            )));
-        }
-        digests.push(digest);
-    }
-    Ok(digests)
+/// One content item's co-hash set: `[(alg-id, digest)]`.
+type ItemHashes = Vec<(String, Vec<u8>)>;
+
+/// Parse the repeatable `--hash` specs into one hashes set per item (each
+/// `--hash` value publishes one `items[]`). The per-value co-hash grammar is
+/// shared with `sign --hash`.
+fn parse_hash_items(
+    values: &[String],
+    default_algs: &[ContentHashAlg],
+) -> Result<Vec<ItemHashes>, CliError> {
+    values
+        .iter()
+        .map(|value| parse_cohash_spec(value, default_algs, "submit"))
+        .collect()
 }
 
 /// Run the `submit` command.
@@ -649,18 +633,22 @@ pub fn run(args: SubmitArgs) -> Result<(), CliError> {
             "submit: --store applies only to --file (it uploads that file's plaintext)",
         ));
     }
+    // Content-discovery mirrors attach to content items only; --merkle carries
+    // its leaves-list URI and --record is verbatim.
+    if !args.uri.is_empty() && matches!(mode, Mode::Merkle | Mode::Record) {
+        return Err(CliError::input(
+            "submit: --uri attaches content mirrors to --hash / --file items; it does not apply \
+             to --merkle or --record",
+        ));
+    }
+    validate_content_uris(&args.uri, "submit")?;
+    let hash_algs = resolve_content_hash_algs(&args.hash_alg, "submit")?;
     let supersedes = match (mode, args.supersedes.as_deref()) {
         (_, None) => None,
         (Mode::Record, Some(_)) => {
             return Err(CliError::input(
                 "submit: --supersedes cannot be combined with --record — the pre-built record \
                  is published byte-for-byte and already carries (or omits) its own supersedes",
-            ));
-        }
-        (Mode::Merkle, Some(_)) => {
-            return Err(CliError::input(
-                "submit: --supersedes is not supported with --merkle here — use \
-                 `attest --leaf … --supersedes <tx>` to publish a superseding Merkle record",
             ));
         }
         (_, Some(value)) => Some(parse_supersedes(value, "submit")?),
@@ -701,32 +689,35 @@ pub fn run(args: SubmitArgs) -> Result<(), CliError> {
     .map_err(|e| CliError::input(format!("submit: {e}")))?;
     let poe = client.poe();
 
-    let build_inputs = |alg: HashAlg| BuildInputs {
-        alg,
+    let build_inputs = BuildInputs {
         signer: signer_ref,
         supersedes: supersedes.as_deref(),
         idempotency_key: args.idempotency_key.as_deref(),
         max_usd_micros,
     };
+    // The explicit content-discovery mirrors attached to every content item.
+    let mirror_uris = args.uri.clone();
+    let item_uris = if mirror_uris.is_empty() {
+        None
+    } else {
+        Some(mirror_uris.clone())
+    };
 
     let mut outcome = match mode {
         Mode::Hash => {
-            let digests = parse_hash_digests(&args.hash)?;
-            let alg = resolve_hash_alg(&args)?;
-            publish_items(&poe, digests, None, &build_inputs(alg), mode)?
+            let items_hashes = parse_hash_items(&args.hash, &hash_algs)?;
+            publish_items(&poe, items_hashes, item_uris, &build_inputs, mode)?
         }
         Mode::File => {
             let path = args.file.as_ref().unwrap();
             let content = std::fs::read(path).map_err(|e| {
                 CliError::network(format!("submit: cannot read --file {path}: {e}"))
             })?;
-            let alg = resolve_hash_alg(&args)?;
-            let digest = alg.digest(&content).to_vec();
-            let inputs = build_inputs(alg);
+            let hashes = cohash_content(&content, &hash_algs);
             if args.store {
-                publish_stored_file(&poe, content, digest, &inputs)?
+                publish_stored_file(&poe, content, hashes, mirror_uris, &build_inputs)?
             } else {
-                publish_items(&poe, vec![digest], None, &inputs, mode)?
+                publish_items(&poe, vec![hashes], item_uris, &build_inputs, mode)?
             }
         }
         Mode::Record => {
@@ -761,15 +752,12 @@ pub fn run(args: SubmitArgs) -> Result<(), CliError> {
         Mode::Merkle => {
             let path = args.merkle.as_ref().unwrap();
             let (leaves, leaf_alg) = load_merkle_leaves(path)?;
-            let alg = args
-                .alg
-                .as_deref()
-                .map(str::to_lowercase)
-                .unwrap_or_else(|| "sha2-256".to_string());
-            if alg != "sha2-256" {
-                return Err(CliError::input(format!(
-                    "submit: --merkle currently supports only sha2-256 leaves (got '{alg}')"
-                )));
+            // The Merkle registry is rfc9162-sha256 only, so the leaves must be
+            // sha2-256; a --hash-alg naming anything else is refused.
+            if hash_algs != [ContentHashAlg::Sha2_256] {
+                return Err(CliError::input(
+                    "submit: --merkle currently supports only sha2-256 leaves".to_string(),
+                ));
             }
             // The SDK helper owns the priced flow: it quotes from the
             // exact-width estimate, enforces the cap, uploads the
@@ -784,6 +772,9 @@ pub fn run(args: SubmitArgs) -> Result<(), CliError> {
                 .transpose()?;
             let mut input = PublishMerkleInput::new(leaves);
             input.leaf_alg = leaf_alg;
+            // The Merkle record can supersede an earlier one (SDK S.2); the
+            // hex string is re-derived from the validated supersedes bytes.
+            input.supersedes = supersedes.as_deref().map(bytes_to_hex);
             input.signer = signer_ref;
             input.max_usd_micros = max_usd_micros_u64;
             input.idempotency_key = args.idempotency_key.clone();
@@ -852,15 +843,17 @@ mod tests {
     use crate::commands::publish_common::resolve_required_gateway_with;
     use crate::secret::resolve_service_gateway;
     use crate::secret::test_support::FakeSecretEnv;
+    use cardanowall::hash::{blake2b256, sha256};
 
     fn base_args() -> SubmitArgs {
         SubmitArgs {
             hash: vec![],
             file: None,
+            uri: vec![],
             store: false,
             merkle: None,
             record: None,
-            alg: None,
+            hash_alg: vec![],
             supersedes: None,
             max_usd: None,
             api_key: None,
@@ -1061,8 +1054,81 @@ mod tests {
         // The digest computed for --file must be exactly the SDK primitive for
         // the selected algorithm — this is the anchored claim.
         let content = b"submit file content";
-        assert_eq!(HashAlg::Sha2_256.digest(content), sha256(content));
-        assert_eq!(HashAlg::Blake2b256.digest(content), blake2b256(content));
+        assert_eq!(ContentHashAlg::Sha2_256.digest(content), sha256(content));
+        assert_eq!(
+            ContentHashAlg::Blake2b256.digest(content),
+            blake2b256(content)
+        );
+    }
+
+    #[test]
+    fn parse_hash_items_supports_bare_pairs_and_co_hash_specs() {
+        let sha = "ab".repeat(32);
+        let blake = "cd".repeat(32);
+        // A bare digest takes the lone default alg.
+        let items =
+            parse_hash_items(std::slice::from_ref(&sha), &[ContentHashAlg::Sha2_256]).unwrap();
+        assert_eq!(items, vec![vec![("sha2-256".to_string(), vec![0xab; 32])]]);
+        // A bare digest under a single non-default alg.
+        let items =
+            parse_hash_items(std::slice::from_ref(&sha), &[ContentHashAlg::Blake2b256]).unwrap();
+        assert_eq!(
+            items,
+            vec![vec![("blake2b-256".to_string(), vec![0xab; 32])]]
+        );
+        // One --hash co-hashing two algorithms → one item, two entries.
+        let spec = format!("sha2-256:{sha},blake2b-256:{blake}");
+        let items = parse_hash_items(&[spec], &[ContentHashAlg::Sha2_256]).unwrap();
+        assert_eq!(
+            items,
+            vec![vec![
+                ("sha2-256".to_string(), vec![0xab; 32]),
+                ("blake2b-256".to_string(), vec![0xcd; 32]),
+            ]]
+        );
+        // Two --hash values → two items.
+        let items =
+            parse_hash_items(&[sha.clone(), blake.clone()], &[ContentHashAlg::Sha2_256]).unwrap();
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn parse_hash_items_rejects_ambiguous_bare_and_repeated_and_bad_shapes() {
+        let sha = "ab".repeat(32);
+        // A bare digest with several default algs is ambiguous.
+        assert_eq!(
+            parse_hash_items(
+                std::slice::from_ref(&sha),
+                &[ContentHashAlg::Sha2_256, ContentHashAlg::Blake2b256]
+            )
+            .unwrap_err()
+            .code,
+            4
+        );
+        // An unknown algorithm token.
+        assert_eq!(
+            parse_hash_items(&[format!("md5:{sha}")], &[ContentHashAlg::Sha2_256])
+                .unwrap_err()
+                .code,
+            4
+        );
+        // Repeating an algorithm inside one item.
+        assert_eq!(
+            parse_hash_items(
+                &[format!("sha2-256:{sha},sha2-256:{sha}")],
+                &[ContentHashAlg::Sha2_256]
+            )
+            .unwrap_err()
+            .code,
+            4
+        );
+        // A wrong-length digest.
+        assert_eq!(
+            parse_hash_items(&["abcd".to_string()], &[ContentHashAlg::Sha2_256])
+                .unwrap_err()
+                .code,
+            4
+        );
     }
 
     #[test]

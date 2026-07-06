@@ -53,6 +53,11 @@ pub enum SecretKind {
     Seed,
     /// The X25519 recipient secret key (recipient-sealed decryption).
     RecipientKey,
+    /// A passphrase (passphrase-sealed encrypt/decrypt). Unlike the byte
+    /// secrets it is used as a UTF-8 string — the crypto layer's pinned
+    /// normalization profile turns it into the Argon2id password — so it is
+    /// resolved via [`resolve_secret_passphrase`], never decoded to bytes.
+    Passphrase,
 }
 
 impl SecretKind {
@@ -62,6 +67,7 @@ impl SecretKind {
         match self {
             SecretKind::Seed => "CARDANOWALL_SEED",
             SecretKind::RecipientKey => "CARDANOWALL_RECIPIENT_KEY",
+            SecretKind::Passphrase => "CARDANOWALL_PASSPHRASE",
         }
     }
 
@@ -71,6 +77,7 @@ impl SecretKind {
         match self {
             SecretKind::Seed => "seed",
             SecretKind::RecipientKey => "secret-key",
+            SecretKind::Passphrase => "passphrase",
         }
     }
 
@@ -79,6 +86,7 @@ impl SecretKind {
         match self {
             SecretKind::Seed => "Enter identity seed (hex or L309-SEED-1...): ",
             SecretKind::RecipientKey => "Enter X25519 recipient secret key (hex): ",
+            SecretKind::Passphrase => "Enter passphrase: ",
         }
     }
 }
@@ -297,6 +305,32 @@ pub fn resolve_secret_bytes(
     result.map(Some)
 }
 
+/// Resolve a passphrase through the same single-source precedence chain as the
+/// byte secrets, returning it as a self-wiping [`Zeroizing<String>`].
+///
+/// A passphrase is NOT decoded to bytes or length-checked here: the crypto
+/// layer's pinned `cardano-poe-pw-norm-v1` normalization (which collapses and
+/// trims surrounding whitespace, bounds the length, and rejects an empty
+/// result) is the sole authority on its shape, and it runs identically at seal
+/// and open across every SDK. `required` and `cmd` shape the prompt / error
+/// text exactly as for the byte secrets.
+///
+/// # Errors
+///
+/// Returns [`CliError`] (exit `4`) on a source conflict, a missing required
+/// passphrase on a non-TTY, or a file/stdin read failure.
+pub fn resolve_secret_passphrase(
+    args: &SecretArgs,
+    required: bool,
+    cmd: &str,
+    env: &dyn SecretEnv,
+) -> Result<Option<Zeroizing<String>>, CliError> {
+    Ok(
+        resolve_secret_string(SecretKind::Passphrase, args, required, cmd, env)?
+            .map(Zeroizing::new),
+    )
+}
+
 /// The string half of the resolution chain (source precedence only, no decode).
 fn resolve_secret_string(
     kind: SecretKind,
@@ -407,6 +441,11 @@ fn decode_and_check(
                 )));
             }
             Ok(bytes)
+        }
+        // A passphrase is a UTF-8 string used as-is (the crypto layer normalizes
+        // it); it never routes through the byte-decode path.
+        SecretKind::Passphrase => {
+            unreachable!("a passphrase is resolved via resolve_secret_passphrase, not decoded")
         }
     }
 }
@@ -1050,6 +1089,63 @@ mod tests {
         assert!(!err.message.contains(&"ab".repeat(31)));
         // It DOES report the length so the user can still self-diagnose.
         assert!(err.message.contains("64-char"));
+    }
+
+    #[test]
+    fn passphrase_resolves_as_a_string_from_every_source() {
+        // File source (trailing newline trimmed).
+        let file_env = FakeEnv {
+            files: HashMap::from([("/p".to_string(), "correct horse\n".to_string())]),
+            ..FakeEnv::default()
+        };
+        let args = SecretArgs {
+            file: Some("/p".to_string()),
+            ..SecretArgs::default()
+        };
+        let pw = resolve_secret_passphrase(&args, true, "seal", &file_env)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*pw, "correct horse");
+
+        // Env source.
+        let env_env = FakeEnv {
+            vars: HashMap::from([(
+                "CARDANOWALL_PASSPHRASE".to_string(),
+                "battery staple".to_string(),
+            )]),
+            ..FakeEnv::default()
+        };
+        let pw = resolve_secret_passphrase(&SecretArgs::default(), true, "seal", &env_env)
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*pw, "battery staple");
+
+        // An optional passphrase absent everywhere is None (the recipient path).
+        assert!(resolve_secret_passphrase(
+            &SecretArgs::default(),
+            false,
+            "seal",
+            &FakeEnv::default()
+        )
+        .unwrap()
+        .is_none());
+
+        // Two sources conflict, like every other secret.
+        let conflict_env = FakeEnv {
+            files: HashMap::from([("/p".to_string(), "a\n".to_string())]),
+            vars: HashMap::from([("CARDANOWALL_PASSPHRASE".to_string(), "b".to_string())]),
+            ..FakeEnv::default()
+        };
+        let args = SecretArgs {
+            file: Some("/p".to_string()),
+            ..SecretArgs::default()
+        };
+        assert_eq!(
+            resolve_secret_passphrase(&args, true, "seal", &conflict_env)
+                .unwrap_err()
+                .code,
+            4
+        );
     }
 
     #[test]

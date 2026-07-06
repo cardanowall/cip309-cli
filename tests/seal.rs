@@ -7,6 +7,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use cardanowall::hash::sha256;
 use cardanowall::poe_standard::EncryptionEnvelope;
@@ -354,6 +355,126 @@ fn seal_to_self_hybrid_slot_really_decrypts() {
 }
 
 #[test]
+fn seal_cohash_reports_the_hashes_map_in_stdout_and_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.bin"), PLAINTEXT).unwrap();
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[1u8; 32]).unwrap().public_key,
+    );
+    let sha = hex::encode(sha256(PLAINTEXT));
+    let blake = hex::encode(cardanowall::hash::blake2b256(PLAINTEXT));
+
+    let stub = StubGateway::start(StubConfig::default());
+    let out = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "draft.bin",
+            "--to",
+            &recipient,
+            "--hash-alg",
+            "sha2-256",
+            "--hash-alg",
+            "blake2b-256",
+            "--receipt-out",
+            "r.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "co-hash seal failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The published record binds BOTH digests, each under its own algorithm
+    // label — the on-chain claim the ciphertext is bound to.
+    let (_, record) = captured_publish_record(&stub);
+    let hashes: BTreeMap<String, Vec<u8>> =
+        record.items.unwrap()[0].hashes.iter().cloned().collect();
+    assert_eq!(hashes.get("sha2-256").unwrap(), &sha256(PLAINTEXT).to_vec());
+    assert_eq!(
+        hashes.get("blake2b-256").unwrap(),
+        &cardanowall::hash::blake2b256(PLAINTEXT).to_vec()
+    );
+
+    // stdout summary: the per-item `hashes` map carries every algorithm, and the
+    // legacy `sha2_256` scalar stays populated because a sha2-256 entry exists.
+    let outcome: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let item = &outcome["items"][0];
+    assert_eq!(item["hashes"]["sha2-256"].as_str().unwrap(), sha);
+    assert_eq!(item["hashes"]["blake2b-256"].as_str().unwrap(), blake);
+    assert_eq!(item["sha2_256"].as_str().unwrap(), sha);
+
+    // The receipt item mirrors the same shape exactly.
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("r.json")).unwrap()).unwrap();
+    let r_item = &receipt["items"][0];
+    assert_eq!(r_item["hashes"]["sha2-256"].as_str().unwrap(), sha);
+    assert_eq!(r_item["hashes"]["blake2b-256"].as_str().unwrap(), blake);
+    assert_eq!(r_item["sha2_256"].as_str().unwrap(), sha);
+}
+
+#[test]
+fn seal_blake2b_only_labels_the_digest_and_omits_the_sha2_legacy_field() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.bin"), PLAINTEXT).unwrap();
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[1u8; 32]).unwrap().public_key,
+    );
+    let blake = hex::encode(cardanowall::hash::blake2b256(PLAINTEXT));
+
+    let stub = StubGateway::start(StubConfig::default());
+    let out = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "draft.bin",
+            "--to",
+            &recipient,
+            "--hash-alg",
+            "blake2b-256",
+            "--receipt-out",
+            "r.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "blake2b-only seal failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout: the map carries only blake2b-256, no sha2-256 entry, and the
+    // legacy `sha2_256` scalar is omitted entirely (never a mislabelled digest).
+    let outcome: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let item = &outcome["items"][0];
+    assert_eq!(item["hashes"]["blake2b-256"].as_str().unwrap(), blake);
+    assert!(item["hashes"]["sha2-256"].is_null());
+    assert!(
+        item.get("sha2_256").is_none(),
+        "sha2_256 must be absent for a blake2b-only item: {item}"
+    );
+
+    // The receipt mirrors it: a blake2b-only map, no legacy sha2_256 field.
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.path().join("r.json")).unwrap()).unwrap();
+    let r_item = &receipt["items"][0];
+    assert_eq!(r_item["hashes"]["blake2b-256"].as_str().unwrap(), blake);
+    assert!(r_item["hashes"]["sha2-256"].is_null());
+    assert!(
+        r_item.get("sha2_256").is_none(),
+        "receipt sha2_256 must be absent for a blake2b-only item: {r_item}"
+    );
+}
+
+#[test]
 fn seal_mixed_kem_recipients_are_refused_before_any_network() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("x.bin"), b"x").unwrap();
@@ -453,5 +574,585 @@ fn seal_sign_attaches_the_identity_signature_and_leaks_no_secrets() {
     assert!(
         unsigned.sigs.is_none(),
         "encryption must not imply authorship"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// seal --resume: finishing a sealed publish that failed after paying uploads
+// ---------------------------------------------------------------------------
+
+/// Every resume-state file in a directory (by the reserved extension).
+fn resume_state_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with(".l309-seal-resume.json"))
+        })
+        .collect()
+}
+
+/// The decoded record bytes of every `POST /poe/publish` the stub captured, in
+/// order. A reject-then-accept run has two (the rejected original + the accepted
+/// resume), so tests read the last.
+fn published_records(stub: &StubGateway) -> Vec<Vec<u8>> {
+    stub.requests_to("/poe/publish")
+        .iter()
+        .map(|r| hex::decode(r.body_json()["record"].as_str().unwrap()).unwrap())
+        .collect()
+}
+
+/// Structurally validate and decode published record bytes.
+fn decode_record(bytes: &[u8]) -> cardanowall::poe_standard::PoeRecord {
+    use cardanowall::poe_standard::{validate_poe_record, ValidateResult, ValidatorOptions};
+    match validate_poe_record(bytes, &ValidatorOptions::default()) {
+        ValidateResult::Ok { record, .. } => *record,
+        ValidateResult::Fail { issues } => panic!("published record is invalid: {issues:?}"),
+    }
+}
+
+/// Read a resume-state file to a JSON value.
+fn read_state(path: &Path) -> serde_json::Value {
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// Rewrite a resume-state file from a mutated JSON value (simulating a tamper).
+fn write_state(path: &Path, state: &serde_json::Value) {
+    std::fs::write(path, serde_json::to_string_pretty(state).unwrap()).unwrap();
+}
+
+#[test]
+fn seal_recipient_failure_writes_a_secret_free_resume_state_and_names_the_command() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("note.bin"), PLAINTEXT).unwrap();
+    // --to-self exercises a seed WITHOUT signing: the seed derives the self slot
+    // but is never persisted, so the file must not carry the seed hex.
+    let seed_hex = "5e".repeat(32);
+
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::Reject,
+        ..StubConfig::default()
+    });
+    let out = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "note.bin",
+            "--to-self",
+            "--resume-state",
+            "resume.json",
+        ])
+        .env("CARDANOWALL_SEED", &seed_hex)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+
+    // The single item uploaded before the publish was rejected, so the paid
+    // upload is in the state file.
+    assert_eq!(stub.requests_to("/poe/uploads").len(), 1);
+    let state_path = dir.path().join("resume.json");
+    let text = std::fs::read_to_string(&state_path).expect("resume-state file written");
+    let state: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(state["version"], 1);
+    assert_eq!(state["format"], "label-309-seal-resume");
+    let uploads = state["uploads"].as_array().unwrap();
+    assert_eq!(uploads.len(), 1, "the completed upload is recorded");
+    assert_eq!(uploads[0]["uri"].as_str().unwrap(), stub_upload_uri(1));
+    assert_eq!(state["to_self"], true);
+    assert_eq!(state["signed"], false);
+
+    // ZERO secrets: neither the seed nor the API key may appear anywhere in the
+    // state file.
+    assert!(
+        !text.contains(&seed_hex),
+        "the seed leaked into the state file"
+    );
+    assert!(
+        !text.contains("stub-test-key"),
+        "the API key leaked into the state file"
+    );
+
+    // stderr names the exact resume command.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cardanowall seal --resume resume.json"),
+        "stderr must name the resume command: {stderr}"
+    );
+}
+
+#[test]
+fn seal_resume_reuses_paid_uploads_and_publishes_a_byte_identical_record() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.bin"), PLAINTEXT).unwrap();
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[9u8; 32]).unwrap().public_key,
+    );
+
+    // One gateway serves both attempts: it rejects the first publish (the failed
+    // run) and accepts the second (the resume). The resume MUST target the same
+    // gateway the state was created against — the security model requires it.
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::RejectFirstThenAccept,
+        ..StubConfig::default()
+    });
+
+    // Attempt 1: the upload succeeds, the publish is rejected → a resume-state
+    // file captures the prepared seal and the paid upload.
+    let first = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "draft.bin",
+            "--to",
+            &recipient,
+            "--resume-state",
+            "state.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1));
+    assert_eq!(stub.requests_to("/poe/uploads").len(), 1);
+
+    // The exact record the resume must publish: the persisted prepared seal
+    // assembled over the persisted (already-paid) storage URI. Same prepared
+    // seal → same record, so this is the strongest possible cross-check.
+    let state = read_state(&dir.path().join("state.json"));
+    let prepared =
+        cardanowall::client::PreparedSeal::from_json(state["prepared_seal"].as_str().unwrap())
+            .unwrap();
+    let paid_uri = state["uploads"][0]["uri"].as_str().unwrap().to_string();
+    let expected_record =
+        cardanowall::client::encode_sealed_record(&prepared, &[paid_uri], None, None).unwrap();
+
+    // Attempt 2: resume against the same gateway. It must NOT re-upload the
+    // ciphertext, and it must publish the exact same record bytes.
+    let resumed = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    assert_eq!(
+        stub.requests_to("/poe/uploads").len(),
+        1,
+        "the resume must reuse the paid upload — the upload count stays 1 across both runs"
+    );
+    let records = published_records(&stub);
+    assert_eq!(
+        records.last().unwrap(),
+        &expected_record,
+        "the resumed record must be byte-identical to an uninterrupted publish of the same seal"
+    );
+
+    // A successful resume removes the state file.
+    assert!(
+        !dir.path().join("state.json").exists(),
+        "the resume must delete the state file on success"
+    );
+}
+
+#[test]
+fn seal_resume_refuses_any_input_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = StubGateway::start(StubConfig::default());
+    // --resume together with a content-shaping flag is a usage error, caught
+    // before the state file is even read (so the path need not exist).
+    let out = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--resume",
+            "nonexistent.json",
+            "--file",
+            "whatever.bin",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--file"),
+        "stderr must name --file: {stderr}"
+    );
+    assert!(
+        stub.requests().is_empty(),
+        "the refusal must fire before any network call"
+    );
+}
+
+#[test]
+fn seal_resume_of_a_signed_publish_requires_the_seed_then_signs() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("x.bin"), PLAINTEXT).unwrap();
+    let seed_hex = "7a".repeat(32);
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[8u8; 32]).unwrap().public_key,
+    );
+
+    // A signed publish that fails after the upload → the state records signed:true.
+    // One gateway serves the failed run and the resume (reject then accept).
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::RejectFirstThenAccept,
+        ..StubConfig::default()
+    });
+    let first = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "x.bin",
+            "--to",
+            &recipient,
+            "--sign",
+            "--resume-state",
+            "state.json",
+        ])
+        .env("CARDANOWALL_SEED", &seed_hex)
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1));
+    assert_eq!(read_state(&dir.path().join("state.json"))["signed"], true);
+
+    // Resume WITHOUT the seed: refused (exit 4), and the state file is left in
+    // place for a retry that supplies the seed. No network call is made.
+    let before = stub.requests().len();
+    let no_seed = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json"])
+        .output()
+        .unwrap();
+    assert_eq!(no_seed.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&no_seed.stderr);
+    assert!(stderr.contains("signed"), "stderr: {stderr}");
+    assert!(stderr.contains("--seed"), "stderr: {stderr}");
+    assert!(
+        dir.path().join("state.json").exists(),
+        "a refused resume must not delete the state file"
+    );
+    assert_eq!(
+        stub.requests().len(),
+        before,
+        "the seed is required before any network call"
+    );
+
+    // Resume WITH the seed: the published record carries the seed's signature,
+    // and the pre-publish summary announces the signer.
+    let signed_resume = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json", "--receipt-out", "r.json"])
+        .env("CARDANOWALL_SEED", &seed_hex)
+        .output()
+        .unwrap();
+    assert_eq!(
+        signed_resume.status.code(),
+        Some(0),
+        "signed resume failed: {}",
+        String::from_utf8_lossy(&signed_resume.stderr)
+    );
+    let seed: [u8; 32] = hex::decode(&seed_hex).unwrap().try_into().unwrap();
+    let signer = cardanowall::seed_derive::signer_from_seed(&seed).unwrap();
+    let expected_pubkey = {
+        use cardanowall::client::Signer as _;
+        hex::encode(signer.signer_pubkey())
+    };
+    // The published wire record actually carries the signature.
+    let record = decode_record(published_records(&stub).last().unwrap());
+    assert!(record.sigs.is_some(), "the resumed record must be signed");
+    // The summary announced the signer identity before publishing.
+    let signed_stderr = String::from_utf8_lossy(&signed_resume.stderr);
+    assert!(
+        signed_stderr.contains(&format!("signer {expected_pubkey}")),
+        "the summary must announce the signer: {signed_stderr}"
+    );
+    // The receipt binds the same identity.
+    let receipt = read_state(&dir.path().join("r.json"));
+    assert_eq!(receipt["signed"], true);
+    assert_eq!(
+        receipt["signer_ed25519"].as_str().unwrap(),
+        expected_pubkey,
+        "the signature must be from the resumed seed's identity"
+    );
+}
+
+#[test]
+fn seal_resume_refuses_a_gateway_the_state_was_not_created_against() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.bin"), PLAINTEXT).unwrap();
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[3u8; 32]).unwrap().public_key,
+    );
+
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::Reject,
+        ..StubConfig::default()
+    });
+    let first = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "draft.bin",
+            "--to",
+            &recipient,
+            "--resume-state",
+            "state.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1));
+
+    // Tamper the persisted gateway URL to an attacker endpoint, keeping the
+    // prepared-seal integrity tag intact (only the URL was changed).
+    let state_path = dir.path().join("state.json");
+    let mut state = read_state(&state_path);
+    state["gateway_base_url"] = serde_json::json!("http://attacker.example.invalid/api/v1");
+    write_state(&state_path, &state);
+
+    // The resume resolves the gateway from trusted sources (env points at the
+    // real stub), sees it differs from the persisted URL, and refuses — WITHOUT
+    // contacting either the real gateway or the attacker endpoint.
+    let before = stub.requests().len();
+    let resumed = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json"])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("created against") && stderr.contains("attacker.example.invalid"),
+        "stderr must flag the gateway mismatch: {stderr}"
+    );
+    assert_eq!(
+        stub.requests().len(),
+        before,
+        "a mismatched-gateway resume must make no network call (bearer key stays put)"
+    );
+}
+
+#[test]
+fn seal_resume_refuses_a_swapped_prepared_seal_that_does_not_match_the_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.bin"), PLAINTEXT).unwrap();
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[4u8; 32]).unwrap().public_key,
+    );
+
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::Reject,
+        ..StubConfig::default()
+    });
+    let first = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "draft.bin",
+            "--to",
+            &recipient,
+            "--resume-state",
+            "state.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1));
+
+    // Forge a DIFFERENT but perfectly valid prepared seal (over content the user
+    // never sealed) and fix the integrity tag, defeating layer (a). The
+    // load-bearing plaintext re-anchor must still reject it: draft.bin does not
+    // hash to the swapped seal's claims.
+    let swapped = {
+        use cardanowall::client::{
+            seal_prepare, SealPrepareInput, SealPrepareItem, SealedKemChoice,
+        };
+        let key = derive_x25519_keypair(&[5u8; 32])
+            .unwrap()
+            .public_key
+            .to_vec();
+        let input =
+            SealPrepareInput::new(vec![SealPrepareItem::new(b"attacker content")], vec![key])
+                .with_kem(SealedKemChoice::X25519);
+        seal_prepare(&input).unwrap().to_json()
+    };
+    let digest = hex::encode(cardanowall::hash::sha256(swapped.as_bytes()));
+    let state_path = dir.path().join("state.json");
+    let mut state = read_state(&state_path);
+    state["prepared_seal"] = serde_json::json!(swapped);
+    state["prepared_sha256"] = serde_json::json!(digest);
+    write_state(&state_path, &state);
+
+    let before = stub.requests().len();
+    let resumed = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json"])
+        .output()
+        .unwrap();
+    assert_eq!(resumed.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains("no longer matches") || stderr.contains("did not seal"),
+        "stderr must flag the plaintext mismatch: {stderr}"
+    );
+    assert_eq!(
+        stub.requests().len(),
+        before,
+        "the plaintext re-anchor must fail before any network call"
+    );
+}
+
+#[test]
+fn seal_resume_surfaces_a_tampered_supersedes_in_the_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.bin"), PLAINTEXT).unwrap();
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[6u8; 32]).unwrap().public_key,
+    );
+
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::RejectFirstThenAccept,
+        ..StubConfig::default()
+    });
+    let first = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "draft.bin",
+            "--to",
+            &recipient,
+            "--resume-state",
+            "state.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1));
+
+    // Inject a supersedes link the original run never had (it is not derived
+    // from the user's files, so the re-anchor cannot catch it).
+    let tx = "ab".repeat(32);
+    let state_path = dir.path().join("state.json");
+    let mut state = read_state(&state_path);
+    state["supersedes"] = serde_json::json!(tx);
+    write_state(&state_path, &state);
+
+    let resumed = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        resumed.status.code(),
+        Some(0),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    // The pre-publish summary makes the injected supersedes visible.
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(
+        stderr.contains(&format!("supersedes:  {tx}")),
+        "the summary must surface the tampered supersedes: {stderr}"
+    );
+}
+
+#[test]
+fn seal_resume_requires_the_files_unless_the_recheck_is_explicitly_waived() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("draft.bin"), PLAINTEXT).unwrap();
+    let recipient = age_recipient(
+        "age",
+        &derive_x25519_keypair(&[7u8; 32]).unwrap().public_key,
+    );
+
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::RejectFirstThenAccept,
+        ..StubConfig::default()
+    });
+    let first = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "draft.bin",
+            "--to",
+            &recipient,
+            "--resume-state",
+            "state.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(first.status.code(), Some(1));
+
+    // The input file is gone at resume time.
+    std::fs::remove_file(dir.path().join("draft.bin")).unwrap();
+
+    // Without the waiver: a hard failure that names the escape hatch, and no
+    // network call.
+    let before = stub.requests().len();
+    let missing = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        stderr.contains("--skip-plaintext-recheck"),
+        "stderr must name the opt-out: {stderr}"
+    );
+    assert_eq!(
+        stub.requests().len(),
+        before,
+        "no network before the waiver"
+    );
+
+    // With the waiver: the resume proceeds and the summary flags the waived check.
+    let waived = cli(&stub, dir.path())
+        .args(["seal", "--resume", "state.json", "--skip-plaintext-recheck"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        waived.status.code(),
+        Some(0),
+        "waived resume failed: {}",
+        String::from_utf8_lossy(&waived.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&waived.stderr).contains("NOT re-verified"),
+        "the summary must flag the waived recheck"
+    );
+}
+
+#[test]
+fn seal_passphrase_failure_writes_no_state_and_says_it_cannot_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret.bin"), PLAINTEXT).unwrap();
+
+    let stub = StubGateway::start(StubConfig {
+        publish: PublishBehavior::Reject,
+        ..StubConfig::default()
+    });
+    let out = cli(&stub, dir.path())
+        .args([
+            "seal",
+            "--file",
+            "secret.bin",
+            "--passphrase",
+            "correct horse battery staple",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+
+    // No resume-state file anywhere: a passphrase seal has no resumable artifact.
+    assert!(
+        resume_state_files(dir.path()).is_empty(),
+        "a passphrase seal must not write a resume-state file"
+    );
+
+    // The error explains why, in one line.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot be resumed"),
+        "stderr must explain that a passphrase seal cannot be resumed: {stderr}"
     );
 }

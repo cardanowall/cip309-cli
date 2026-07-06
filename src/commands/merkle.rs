@@ -148,18 +148,23 @@ fn run_verify(args: MerkleVerifyArgs) -> Result<(), CliError> {
             args.proof
         ))
     })?;
-    // A proof file that is present but not valid JSON is unparseable input, also
-    // the network class per the exit-code taxonomy (IO / unparseable content).
+    // A proof file that is present but not valid JSON is malformed input (exit 4),
+    // the same class as bad hex — the content never reached the inclusion check.
+    // Exit 2 stays reserved for an unreadable file (an IO failure a CI retry may
+    // legitimately treat as transient); unparseable bytes are not transient.
     let file: ProofFile = serde_json::from_str(&file_text).map_err(|e| {
-        CliError::network(format!(
+        CliError::input(format!(
             "merkle verify: proof file {} is not valid JSON: {e}",
             args.proof
         ))
     })?;
 
+    // Every schema check below fails BEFORE the inclusion check runs, so it is
+    // malformed input (exit 4), never an integrity verdict — exit 1 stays
+    // reserved for a well-formed proof that does not verify.
     if let Some(alg) = &file.tree_alg {
         if alg != MERKLE_ALG_ID {
-            return Err(CliError::integrity(format!(
+            return Err(CliError::input(format!(
                 "merkle verify: proof file {} carries tree_alg=\"{alg}\"; only \"{MERKLE_ALG_ID}\" is supported",
                 args.proof
             )));
@@ -169,7 +174,7 @@ fn run_verify(args: MerkleVerifyArgs) -> Result<(), CliError> {
     let tree_size = ensure_uint(file.tree_size, "tree_size")?;
     let index = ensure_uint(file.index, "index")?;
     if index >= tree_size {
-        return Err(CliError::integrity(format!(
+        return Err(CliError::input(format!(
             "merkle verify: index {index} must be < tree_size {tree_size}"
         )));
     }
@@ -179,7 +184,7 @@ fn run_verify(args: MerkleVerifyArgs) -> Result<(), CliError> {
         .as_deref()
         .or(file.leaf.as_deref())
         .ok_or_else(|| {
-            CliError::integrity(
+            CliError::input(
                 "merkle verify: --leaf is required when proof file has no \"leaf\" field",
             )
         })?
@@ -187,7 +192,7 @@ fn run_verify(args: MerkleVerifyArgs) -> Result<(), CliError> {
     let leaf_bytes = ensure_hex32(&leaf_hex_source, "leaf")?;
 
     let proof_arr = file.proof.ok_or_else(|| {
-        CliError::integrity(format!(
+        CliError::input(format!(
             "merkle verify: proof file {} must contain a \"proof\" array",
             args.proof
         ))
@@ -195,7 +200,7 @@ fn run_verify(args: MerkleVerifyArgs) -> Result<(), CliError> {
     let mut proof_bytes: Vec<[u8; 32]> = Vec::with_capacity(proof_arr.len());
     for (i, v) in proof_arr.iter().enumerate() {
         let hex = v.as_str().ok_or_else(|| {
-            CliError::integrity(format!("merkle verify: proof[{i}] must be a hex string"))
+            CliError::input(format!("merkle verify: proof[{i}] must be a hex string"))
         })?;
         let b = ensure_hex32(hex, &format!("proof[{i}]"))?;
         let mut arr = [0u8; 32];
@@ -427,7 +432,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_json_proof_file_is_network_error() {
+    fn invalid_json_proof_file_is_input_error() {
+        // A present-but-unparseable proof file is malformed input (exit 4), not
+        // the transient network class — a CI retry must not treat it as flaky.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proof.json");
         std::fs::write(&path, "this is not json").unwrap();
@@ -438,7 +445,58 @@ mod tests {
             json: false,
         };
         let err = run_verify(args).unwrap_err();
-        assert_eq!(err.code, 2);
+        assert_eq!(err.code, 4);
+    }
+
+    #[test]
+    fn schema_invalid_proof_content_is_input_error() {
+        // Content that parses as JSON but fails a schema check (here an
+        // unsupported tree_alg) is malformed input (exit 4), aligned with bad
+        // hex — never the integrity class, which is reserved for a well-formed
+        // proof that does not verify.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proof.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "tree_alg": "not-a-real-alg",
+                "tree_size": 2,
+                "index": 0,
+                "leaf": "ab".repeat(32),
+                "proof": ["cd".repeat(32)],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let args = MerkleVerifyArgs {
+            root: "ab".repeat(32),
+            leaf: None,
+            proof: path.to_string_lossy().into_owned(),
+            json: false,
+        };
+        assert_eq!(run_verify(args).unwrap_err().code, 4);
+
+        // A structurally-present proof whose index is out of range is likewise
+        // malformed input, not an integrity verdict.
+        let oor = dir.path().join("oor.json");
+        std::fs::write(
+            &oor,
+            serde_json::json!({
+                "tree_size": 2,
+                "index": 5,
+                "leaf": "ab".repeat(32),
+                "proof": ["cd".repeat(32)],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let oor_args = MerkleVerifyArgs {
+            root: "ab".repeat(32),
+            leaf: None,
+            proof: oor.to_string_lossy().into_owned(),
+            json: false,
+        };
+        assert_eq!(run_verify(oor_args).unwrap_err().code, 4);
     }
 
     #[test]

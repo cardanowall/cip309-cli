@@ -1,0 +1,32 @@
+{
+  "description": "One item sealed under a shared passphrase; counter rng from 0. The passphrase prepared seal has no portable to_json form, so this vector pins the byte-deterministic derived values (prepared_sha256, item_ids, upload keys, record bytes) instead of a serialized artifact.",
+  "deterministic_rng": {
+    "start": 0,
+    "type": "counter-u8"
+  },
+  "expected": {
+    "item_ids": [
+      "90b071b321cfb46b96de1e8a76630499df33bf939c7e0fdf652c4dccc326bed8"
+    ],
+    "prepared_sha256": "8bf89d790e301f3071384d93815833e29dc370859c190251ac4439eeff95ee3c",
+    "record_hex": "a2617601656974656d7381a363656e63a46461656164781b63686163686132302d706f6c79313330352d73747265616d36346b656e6f6e63655818101112131415161718191a1b1c1d1e1f202122232425262766736368656d65016a70617373706872617365a363616c67686172676f6e3269646473616c7450000102030405060708090a0b0c0d0e0f66706172616d73a3616d1a00010000617004617403647572697381783061723a2f2f4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b66686173686573a168736861322d3235365820997c3d898a1de5628beab9233eb83d6adca412e79d52441d8cc96cf87ee3205a",
+    "upload_idempotency_keys": [
+      "pwseal1-8bf89d790e301f3071384d93815833e2-0"
+    ]
+  },
+  "hash_alg": "sha2-256",
+  "params": {
+    "m": 65536,
+    "p": 4,
+    "t": 3
+  },
+  "passphrase": "correct horse battery staple",
+  "plaintexts_hex": [
+    "70726570617265642d7365616c20766563746f7220706173737068726173653a2073696e676c65206974656d"
+  ],
+  "signers": null,
+  "supersedes": null,
+  "uris": [
+    "ar://KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK"
+  ]
+}

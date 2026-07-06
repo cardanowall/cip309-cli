@@ -13,6 +13,7 @@ pub mod inbox;
 pub mod merkle;
 pub mod publish_common;
 pub mod seal;
+pub mod seal_resume;
 pub mod sign;
 pub mod submit;
 pub mod verify;

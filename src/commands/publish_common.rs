@@ -14,10 +14,12 @@ use cardanowall::client::{
     assemble_cose_sign1, prepare_sig_structure, ClientError, Label309Client, PoeEventsError,
     PoeNamespace, PoeStatusSnapshot, PoeWaitError, PoeWaitInput, PoeWaitTarget, PublishError,
     PublishHelperError, QuoteInput, QuoteResponse, ResumableUploadError, SealPrepareError, Signer,
-    DEFAULT_EVENTS_BACKOFF,
+    SupportedHashAlg, DEFAULT_EVENTS_BACKOFF,
 };
 use cardanowall::poe_standard::{encode_poe_record, PoeRecord};
 use cardanowall::seed_derive::{signer_from_seed, SeedSigner};
+
+use serde::Serialize;
 
 use crate::config::{load_config_for_edit, CardanoWallConfig, SystemConfigEnv};
 use crate::secret::{
@@ -25,7 +27,7 @@ use crate::secret::{
     ServiceGateway,
 };
 use crate::util::rfc3339::rfc3339_to_epoch_seconds;
-use crate::util::{format_usd_micros, hex_to_bytes, CliError};
+use crate::util::{bytes_to_hex, format_usd_micros, hex_to_bytes, CliError};
 
 /// A worst-case-width stand-in for the `ar://<tx>` URI a leaves-list upload
 /// will mint. An Arweave transaction id is always 43 base64url characters, so
@@ -68,6 +70,239 @@ const UPLOAD_KEY_DIGEST_CHARS: usize = 32;
 pub fn content_upload_idempotency_key(role: &str, blob: &[u8]) -> String {
     let digest = cardanowall::hex::encode(&cardanowall::hash::sha256(blob));
     format!("{role}{}", &digest[..UPLOAD_KEY_DIGEST_CHARS])
+}
+
+/// A content-hash algorithm the anchoring commands can co-hash an item under.
+///
+/// Both members are mandatory-to-implement in the Label 309 registry and are
+/// selectable together (a co-hash item carrying both digests); the registry has
+/// no third algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentHashAlg {
+    /// SHA-256 (`sha2-256`).
+    Sha2_256,
+    /// BLAKE2b-256 (`blake2b-256`).
+    Blake2b256,
+}
+
+impl ContentHashAlg {
+    /// The on-wire algorithm identifier.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContentHashAlg::Sha2_256 => "sha2-256",
+            ContentHashAlg::Blake2b256 => "blake2b-256",
+        }
+    }
+
+    /// The 32-byte digest of `content` under this algorithm — the anchored claim.
+    #[must_use]
+    pub fn digest(self, content: &[u8]) -> [u8; 32] {
+        match self {
+            ContentHashAlg::Sha2_256 => cardanowall::hash::sha256(content),
+            ContentHashAlg::Blake2b256 => cardanowall::hash::blake2b256(content),
+        }
+    }
+
+    /// The SDK-side hash-algorithm enum this maps to, for the sealed-PoE prepare
+    /// builders. The two enums carry the same closed content-hash catalogue.
+    #[must_use]
+    pub fn to_sdk(self) -> SupportedHashAlg {
+        match self {
+            ContentHashAlg::Sha2_256 => SupportedHashAlg::Sha2_256,
+            ContentHashAlg::Blake2b256 => SupportedHashAlg::Blake2b256,
+        }
+    }
+
+    /// Parse a lowercase algorithm identifier, or `None` when it is not a
+    /// registered content-hash algorithm.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "sha2-256" => Some(ContentHashAlg::Sha2_256),
+            "blake2b-256" => Some(ContentHashAlg::Blake2b256),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the repeatable `--hash-alg` values into a deduplicated algorithm
+/// set, defaulting to a single `sha2-256` when none are given. A single
+/// algorithm produces the same one-entry `hashes` map (and identical record
+/// bytes) as before co-hashing; several co-hash the item under each.
+///
+/// # Errors
+///
+/// Returns [`CliError`] (exit `4`) when a value is not a registered algorithm.
+pub fn resolve_content_hash_algs(
+    values: &[String],
+    command: &str,
+) -> Result<Vec<ContentHashAlg>, CliError> {
+    let mut algs: Vec<ContentHashAlg> = Vec::new();
+    for value in values {
+        let name = value.trim().to_lowercase();
+        let alg = ContentHashAlg::parse(&name).ok_or_else(|| {
+            CliError::input(format!(
+                "{command}: --hash-alg must be 'sha2-256' or 'blake2b-256' (got '{name}')"
+            ))
+        })?;
+        if !algs.contains(&alg) {
+            algs.push(alg);
+        }
+    }
+    if algs.is_empty() {
+        algs.push(ContentHashAlg::Sha2_256);
+    }
+    Ok(algs)
+}
+
+/// Co-hash `content` under every algorithm into a record `hashes` vector
+/// (`[(alg-id, digest)]`). The canonical encoder sorts the entries, so the
+/// vector order does not affect the record bytes.
+#[must_use]
+pub fn cohash_content(content: &[u8], algs: &[ContentHashAlg]) -> Vec<(String, Vec<u8>)> {
+    algs.iter()
+        .map(|alg| (alg.as_str().to_string(), alg.digest(content).to_vec()))
+        .collect()
+}
+
+/// One item's per-algorithm digests, serialized as the spec's `hashes` map — a
+/// JSON object `{ "<alg-id>": "<hex-digest>" }`. Every anchoring command that
+/// reports an item's digests uses this, so a non-sha2 or co-hash digest is
+/// always labelled by the algorithm that actually produced it (never silently
+/// filed under `sha2_256`). Entry order follows the record's co-hash order.
+#[derive(Debug, Clone)]
+pub struct ItemHashesMap(Vec<(String, String)>);
+
+impl ItemHashesMap {
+    /// Build from the published `[(alg-id, digest-bytes)]`, hex-encoding each
+    /// digest under its own algorithm label.
+    #[must_use]
+    pub fn from_item_hashes(hashes: &[(String, Vec<u8>)]) -> Self {
+        ItemHashesMap(
+            hashes
+                .iter()
+                .map(|(alg, digest)| (alg.clone(), bytes_to_hex(digest)))
+                .collect(),
+        )
+    }
+
+    /// The `sha2-256` digest hex, when the item carries a sha2-256 entry — the
+    /// only case the legacy `sha2_256` / `item_sha2_256` field is populated. It
+    /// never carries another algorithm's digest.
+    #[must_use]
+    pub fn sha2_256(&self) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(alg, _)| alg == "sha2-256")
+            .map(|(_, hex)| hex.clone())
+    }
+
+    /// The `[(alg-id, hex-digest)]` entries in co-hash order, for a
+    /// human-readable listing.
+    #[must_use]
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.0
+    }
+}
+
+impl Serialize for ItemHashesMap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (alg, hex) in &self.0 {
+            map.serialize_entry(alg, hex)?;
+        }
+        map.end()
+    }
+}
+
+/// Every registered content-hash digest (`sha2-256`, `blake2b-256`) is 32 bytes.
+const CONTENT_DIGEST_BYTES: usize = 32;
+
+/// Parse one precomputed-hash spec into an item's `hashes` set. A spec is a
+/// comma-separated list of one or more hash specs; a spec is either an explicit
+/// `alg:digest` pair (co-hashing one item under several algorithms) or a bare
+/// `digest` that takes `default_algs` — which MUST be exactly one algorithm, a
+/// bare precomputed digest cannot belong to several at once. An item may not
+/// repeat an algorithm. Shared by `submit --hash` and `sign --hash`.
+///
+/// # Errors
+///
+/// Returns [`CliError`] (exit `4`) on an unregistered algorithm, a bare digest
+/// under an ambiguous multi-algorithm default, a wrong-length digest, a
+/// repeated algorithm, or an empty spec.
+pub fn parse_cohash_spec(
+    value: &str,
+    default_algs: &[ContentHashAlg],
+    command: &str,
+) -> Result<Vec<(String, Vec<u8>)>, CliError> {
+    let mut hashes: Vec<(String, Vec<u8>)> = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (alg_id, digest_hex) = if let Some((alg, digest)) = part.split_once(':') {
+            let alg = alg.trim().to_lowercase();
+            if ContentHashAlg::parse(&alg).is_none() {
+                return Err(CliError::input(format!(
+                    "{command}: --hash algorithm '{alg}' is not registered (use sha2-256 or blake2b-256)"
+                )));
+            }
+            (alg, digest.trim().to_lowercase())
+        } else {
+            if default_algs.len() != 1 {
+                return Err(CliError::input(format!(
+                    "{command}: a bare --hash digest needs an explicit alg:digest when several \
+                     --hash-alg are set"
+                )));
+            }
+            (default_algs[0].as_str().to_string(), part.to_lowercase())
+        };
+        let digest = crate::util::hex_to_bytes(&digest_hex)
+            .map_err(|e| CliError::input(format!("{command}: --hash {e}")))?;
+        if digest.len() != CONTENT_DIGEST_BYTES {
+            return Err(CliError::input(format!(
+                "{command}: --hash {alg_id} digest must decode to exactly {CONTENT_DIGEST_BYTES} \
+                 bytes (got {})",
+                digest.len()
+            )));
+        }
+        if hashes.iter().any(|(existing, _)| existing == &alg_id) {
+            return Err(CliError::input(format!(
+                "{command}: --hash item repeats algorithm '{alg_id}'"
+            )));
+        }
+        hashes.push((alg_id, digest));
+    }
+    if hashes.is_empty() {
+        return Err(CliError::input(format!(
+            "{command}: a --hash value must carry at least one digest"
+        )));
+    }
+    Ok(hashes)
+}
+
+/// Validate a `--uri` mirror list against the record's fetch set. Every entry
+/// MUST satisfy the SAME strict grammar the canonical record validator enforces
+/// (`cardanowall::poe_standard::is_fetch_set_uri`): an absolute `ar://<43-char
+/// base64url txid>` or `ipfs://<CID>` URI with no fragment. Delegating to the
+/// one validator means the CLI's early check and the on-record check can never
+/// diverge — a `--uri ar://bad#fragment` is rejected here, not silently later.
+///
+/// # Errors
+///
+/// Returns [`CliError`] (exit `4`) naming the first offending URI.
+pub fn validate_content_uris(uris: &[String], command: &str) -> Result<(), CliError> {
+    for uri in uris {
+        if !cardanowall::poe_standard::is_fetch_set_uri(uri) {
+            return Err(CliError::input(format!(
+                "{command}: --uri must be an absolute ar:// or ipfs:// uri (got '{uri}')"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The gateway inputs an anchoring command collects from argv.
@@ -585,6 +820,94 @@ mod tests {
         assert_eq!(ok, vec![0xab; 32]);
         for bad in ["", "abcd", &"zz".repeat(32)[..]] {
             assert_eq!(parse_supersedes(bad, "submit").unwrap_err().code, 4);
+        }
+    }
+
+    #[test]
+    fn hash_alg_resolution_dedupes_and_defaults_to_sha2_256() {
+        // No flags → a single sha2-256.
+        assert_eq!(
+            resolve_content_hash_algs(&[], "submit").unwrap(),
+            vec![ContentHashAlg::Sha2_256]
+        );
+        // Co-hash, first-seen order, deduplicated.
+        assert_eq!(
+            resolve_content_hash_algs(
+                &[
+                    "blake2b-256".to_string(),
+                    "sha2-256".to_string(),
+                    "BLAKE2B-256".to_string(),
+                ],
+                "submit"
+            )
+            .unwrap(),
+            vec![ContentHashAlg::Blake2b256, ContentHashAlg::Sha2_256]
+        );
+        // An unregistered algorithm is a CLI input error.
+        assert_eq!(
+            resolve_content_hash_algs(&["md5".to_string()], "submit")
+                .unwrap_err()
+                .code,
+            4
+        );
+    }
+
+    #[test]
+    fn cohash_content_matches_the_sdk_primitives_for_every_alg() {
+        let content = b"co-hash content";
+        let hashes = cohash_content(
+            content,
+            &[ContentHashAlg::Sha2_256, ContentHashAlg::Blake2b256],
+        );
+        assert_eq!(
+            hashes,
+            vec![
+                (
+                    "sha2-256".to_string(),
+                    cardanowall::hash::sha256(content).to_vec()
+                ),
+                (
+                    "blake2b-256".to_string(),
+                    cardanowall::hash::blake2b256(content).to_vec()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fetch_uri_validation_accepts_the_fetch_set_and_rejects_everything_else() {
+        // The early `--uri` check delegates to the canonical fetch-set grammar,
+        // so a valid Arweave txid and a real CID pass.
+        validate_content_uris(
+            &[
+                "ar://0123456789abcdefghijklmnopqrstuvwxyzABCDEFG".to_string(),
+                "ipfs://QmbFMke1KXqnYyBBWxB74N4c5SBnJMVAiMNRcGu6x1AwQH".to_string(),
+            ],
+            "submit",
+        )
+        .unwrap();
+        // Regression: the old early check only tested a non-empty ar://|ipfs://
+        // prefix, so a fragment, a wrong-length ar:// txid, and a malformed CID
+        // all slipped through to fail only at canonical validation later. The
+        // strict single-source validator rejects each one up front.
+        for bad in [
+            "",
+            "ar://",
+            "https://example.com/x",
+            "ipfs://",
+            "ar://0123456789abcdefghijklmnopqrstuvwxyzABCDEFG#fragment",
+            "ar://tooshort",
+            "ar://0123456789abcdefghijklmnopqrstuvwxyzABCDEFGH", // 44 chars
+            "ipfs://bafybeih",                                   // not a valid CID
+            "ipfs://not-a-cid",
+        ] {
+            assert_eq!(
+                validate_content_uris(&[bad.to_string()], "submit")
+                    .unwrap_err()
+                    .code,
+                4,
+                "expected {bad:?} to be rejected"
+            );
         }
     }
 }

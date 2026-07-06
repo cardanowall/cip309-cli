@@ -48,7 +48,7 @@ use crate::util::version::version_string;
         CARDANOWALL_BASE_URL       gateway base URL incl. version, e.g. .../api/v1  (--base-url)\n  \
         CARDANOWALL_API_KEY        opaque bearer API key   (--api-key)\n  \
         CARDANOWALL_SEED           identity seed: hex or L309-SEED-1...  (--seed)\n  \
-        CARDANOWALL_RECIPIENT_KEY  X25519 recipient key (hex)  (--secret-key)\n  \
+        CARDANOWALL_RECIPIENT_KEY  raw 32-byte recipient secret: X25519 priv or X-Wing seed (hex)  (--secret-key)\n  \
         CARDANOWALL_CARDANO_GATEWAY / CARDANOWALL_ARWEAVE_GATEWAY /\n  \
         CARDANOWALL_IPFS_GATEWAY / CARDANOWALL_BLOCKFROST_PROJECT_ID /\n  \
         CARDANOWALL_CONFIRMATION_DEPTH_THRESHOLD / CARDANOWALL_DENY_HOST /\n  \

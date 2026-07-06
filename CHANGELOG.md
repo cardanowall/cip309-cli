@@ -9,6 +9,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] - 2026-07-06
+
+Built and tested against the `cardanowall` SDK 0.11.0.
+
+### Added
+
+- Co-hashing across the publishing commands: `--hash-alg` is repeatable on `submit`, `attest`, `seal`, and `sign`, so one record can commit to the same content under more than one digest (for example SHA2-256 plus BLAKE2b-256). The JSON output reports a per-item hashes map keyed by algorithm rather than a single digest.
+- Passphrase sealing and opening. `seal --passphrase` wraps every item's content-encryption key from an Argon2id-derived key instead of recipient keys, so anyone holding the passphrase can open the record; `verify` and `inbox` accept the same `--passphrase` to open a passphrase-sealed record. Recipient and passphrase modes are mutually exclusive per record.
+- `verify` gains a local record mode: `--record <file|->` validates and verifies a pre-fetched record with no network call, `--network` selects the chain for tx-reference verification, and out-of-band content is supplied with `--ciphertext` / `--merkle-leaves`. `--max-fetch-bytes` caps how many bytes any URI fetch may pull.
+- `submit` and `attest` accept a repeatable `--uri` to attach a plural fetch-set to a single-leaf record; `--supersedes` links a record to the transaction it supersedes on `seal` and on `submit --merkle`.
+- `sign prepare` / `sign assemble` gain a `--hashed` mode: the signer receives the already-hashed COSE `Sig_structure` for a constrained CIP-8 signer that hashes out of band.
+- `seal --resume` recovers a sealed publish that failed after its ciphertext uploads were paid for, re-using the completed upload receipts from the seal receipt instead of re-encrypting and re-paying storage. The resume path resolves its gateway from a trusted source and binds to the saved state tamper-evidently.
+
+### Changed
+
+- `inbox decrypt` handles a multi-recipient record gracefully: it opens the slot addressed to the caller and skips the rest instead of failing the whole record, surfaces the record signer, and accepts KEM-agnostic raw recipient keys. Its JSON/`--out` contract is stabilized.
+- `merkle-verify` exit codes are aligned with the rest of the CLI (a verification failure and a usage error are distinct, scriptable codes).
+
+### Fixed
+
+- `attest` and `submit` JSON no longer mislabel digests: the per-item hashes map is keyed by the actual algorithm, so a co-hashed item's digests are never conflated.
+
 ## [0.10.0] - 2026-07-05
 
 Built and tested against the `cardanowall` SDK 0.10.0.

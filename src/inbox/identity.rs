@@ -4,12 +4,15 @@
 //!
 //! - `--seed <hex32>`        → the 32-byte master identity seed. Runs the full
 //!   derivation (Ed25519 + X25519 + X-Wing), so this is the only path that can
-//!   locate the bookmark file (keyed by the Ed25519 public key) AND read hybrid
-//!   (`mlkem768x25519`) sealed records.
-//! - `--secret-key <hex32>`  → raw X25519 secret bytes (testing + power users).
-//!   The Ed25519 pubkey is NOT recoverable from this path, so the
-//!   bookmark-locating commands need the seed path; this surface returns `None`
-//!   for the Ed25519 fields and callers must check.
+//!   locate the bookmark file — its path is keyed by the Ed25519 public key,
+//!   which a raw key cannot recover.
+//! - `--secret-key <hex32>`  → a raw 32-byte recipient secret (testing + power
+//!   users). It is KEM-agnostic: the same bytes serve as the X25519 private key
+//!   OR the X-Wing decapsulation seed, and the bundle's KEM dispatch selects the
+//!   role from the sealed record's `kem` — the same semantics as
+//!   `verify --secret-key`. The Ed25519 pubkey is NOT recoverable from it, so the
+//!   bookmark-locating commands still need the seed path; this surface returns
+//!   `None` for the Ed25519 fields and callers must check.
 
 use cardanowall::sealed_poe::RecipientKeyBundle;
 use cardanowall::seed_derive::{
@@ -40,8 +43,10 @@ pub struct IdentitySource {
     /// read the seed from stdin (also `--seed -`).
     #[arg(long = "seed-stdin")]
     pub seed_stdin: bool,
-    /// X25519 identity private key as 64-char lowercase hex. INSECURE on argv;
-    /// prefer --secret-key-file / --secret-key-stdin / CARDANOWALL_RECIPIENT_KEY.
+    /// raw 32-byte recipient secret as 64-char lowercase hex — an X25519 private
+    /// key OR an X-Wing decapsulation seed, dispatched on the sealed record's KEM.
+    /// INSECURE on argv; prefer --secret-key-file / --secret-key-stdin /
+    /// CARDANOWALL_RECIPIENT_KEY.
     #[arg(long = "secret-key")]
     pub secret_key: Option<String>,
     /// read the X25519 secret key from a file.
@@ -83,6 +88,18 @@ impl IdentitySource {
             file: self.secret_key_file.clone(),
             stdin: self.secret_key_stdin,
         }
+    }
+
+    /// Whether the user supplied any recipient identity (seed or secret-key)
+    /// from argv or the environment. When false, a decrypt can still open a
+    /// passphrase-sealed record from a supplied passphrase, so the caller treats
+    /// the identity as optional rather than resolving (and erroring on) it.
+    #[must_use]
+    pub fn any_present(&self, env: &dyn SecretEnv) -> bool {
+        self.seed_args().any_present()
+            || env.var(SecretKind::Seed.env_var()).is_some()
+            || self.secret_key_args().any_present()
+            || env.var(SecretKind::RecipientKey.env_var()).is_some()
     }
 
     /// Resolve to exactly one identity, choosing the family the user supplied and
@@ -140,8 +157,11 @@ impl IdentitySource {
 pub struct ResolvedIdentity {
     /// The raw X25519 private key (always present).
     pub x25519_private_key: Vec<u8>,
-    /// The X-Wing secret seed for hybrid records; `None` on the `--secret-key`
-    /// path (no seed to derive it from, so hybrid records cleanly non-match).
+    /// The X-Wing decapsulation seed for hybrid records. On the `--seed` path it
+    /// is derived distinctly from the seed; on the raw `--secret-key` path it is
+    /// the same 32 bytes as [`x25519_private_key`](Self::x25519_private_key), so a
+    /// raw key opens hybrid records too (KEM-agnostic, matching
+    /// `verify --secret-key`). Always populated now.
     pub mlkem768x25519_secret_seed: Option<Vec<u8>>,
     /// The Ed25519 public key; `None` on the `--secret-key` path.
     pub ed25519_public_key: Option<Vec<u8>>,
@@ -293,12 +313,18 @@ fn resolve_from_secret_key_hex(secret_key_hex: &str) -> Result<ResolvedIdentity,
     resolve_from_secret_key_bytes(&bytes)
 }
 
-/// Build an X25519-only identity from 32 raw secret-key bytes (no seed → no
-/// Ed25519 derivation, no X-Wing hybrid secret).
+/// Build a KEM-agnostic identity from 32 raw secret-key bytes (no seed → no
+/// Ed25519 derivation, so no bookmark path).
+///
+/// A raw recipient secret carries no KEM tag, so the same 32 bytes populate BOTH
+/// bundle roles: the X25519 private key AND the X-Wing decapsulation seed. The
+/// bundle's KEM dispatch then selects the right role from the sealed record's
+/// `kem`, so a raw key opens both classical and hybrid records — the same
+/// semantics `verify --secret-key` gets from its flat KEM-agnostic key list.
 fn resolve_from_secret_key_bytes(bytes: &[u8]) -> Result<ResolvedIdentity, CliError> {
     Ok(ResolvedIdentity {
         x25519_private_key: bytes.to_vec(),
-        mlkem768x25519_secret_seed: None,
+        mlkem768x25519_secret_seed: Some(bytes.to_vec()),
         ed25519_public_key: None,
     })
 }
@@ -318,12 +344,21 @@ mod tests {
     }
 
     #[test]
-    fn secret_key_path_has_no_ed25519_or_hybrid() {
+    fn secret_key_path_is_kem_agnostic_without_ed25519() {
+        // A raw --secret-key derives no Ed25519 key (so it cannot locate the
+        // bookmark), but it IS KEM-agnostic: the same 32 bytes fill both bundle
+        // roles, so it opens classical AND hybrid records — matching verify.
         let id = resolve_identity(None, Some(&"ab".repeat(32)), "inbox sync").unwrap();
         assert!(id.ed25519_public_key.is_none());
-        assert!(id.mlkem768x25519_secret_seed.is_none());
+        assert!(id.mlkem768x25519_secret_seed.is_some());
         let bundle = id.recipient_key_bundle();
-        assert!(bundle.mlkem768x25519_secret_seeds.is_empty());
+        assert_eq!(bundle.x25519_private_keys.len(), 1);
+        assert_eq!(bundle.mlkem768x25519_secret_seeds.len(), 1);
+        // Both roles hold the identical raw key.
+        assert_eq!(
+            bundle.x25519_private_keys[0],
+            bundle.mlkem768x25519_secret_seeds[0]
+        );
     }
 
     #[test]

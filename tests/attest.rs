@@ -1496,3 +1496,157 @@ fn submit_dedup_replay_reports_replayed_with_no_new_debit() {
     assert_eq!(outcome["status"], "confirming");
     assert_eq!(outcome["balance_after_usd_micros"], "8500000");
 }
+
+// ---------------------------------------------------------------------------
+// attest single-item hashes map: every digest is labelled by its algorithm,
+// and the legacy `sha2_256` / `item_sha2_256` field never carries a non-sha2
+// digest.
+// ---------------------------------------------------------------------------
+
+/// A blake2b-256 pass-through leaf is reported under `blake2b-256` — never
+/// mislabelled as sha2-256 — and the legacy `sha2_256` convenience field is
+/// absent because the item carries no sha2-256 digest. Covers both the stdout
+/// JSON and the portable receipt file.
+#[test]
+fn attest_single_leaf_blake2b_is_labelled_and_omits_the_sha2_legacy_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = StubGateway::start(StubConfig::default());
+    let blake = "ab".repeat(32);
+    let out = cli(&stub, dir.path())
+        .args([
+            "attest",
+            "--leaf",
+            &blake,
+            "--hash-alg",
+            "blake2b-256",
+            "--receipt-out",
+            "r.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "attest --leaf blake2b failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The published record labels the digest blake2b-256, not sha2-256.
+    let (_, record) = captured_record(&stub);
+    let items = record.items.expect("a 1-leaf attest publishes items[]");
+    assert_eq!(items[0].hashes.len(), 1);
+    assert_eq!(items[0].hashes[0].0, "blake2b-256");
+
+    // stdout JSON: the hashes map carries the blake2b entry under its own
+    // label, no sha2-256 entry, and no legacy item_sha2_256 field.
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        stdout["item_hashes"]["blake2b-256"].as_str().unwrap(),
+        blake
+    );
+    assert!(stdout["item_hashes"]["sha2-256"].is_null());
+    assert!(
+        stdout.get("item_sha2_256").is_none(),
+        "item_sha2_256 must be absent for a non-sha2 item: {stdout}"
+    );
+
+    // Portable receipt file: same shape on items[0].
+    let receipt = read_json(&dir.path().join("r.json"));
+    let item = &receipt["items"][0];
+    assert_eq!(item["hashes"]["blake2b-256"].as_str().unwrap(), blake);
+    assert!(item["hashes"]["sha2-256"].is_null());
+    assert!(
+        item.get("sha2_256").is_none(),
+        "receipt item sha2_256 must be absent for a non-sha2 item: {item}"
+    );
+}
+
+/// A co-hashed single file reports both digests, each under its own algorithm,
+/// and the legacy `sha2_256` field carries the sha2-256 digest (never the
+/// blake2b one). Covers both the stdout JSON and the receipt file.
+#[test]
+fn attest_single_file_cohash_labels_every_digest_and_keeps_the_sha2_legacy_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = b"co-hash artifact";
+    std::fs::write(dir.path().join("only.txt"), content).unwrap();
+    let stub = StubGateway::start(StubConfig::default());
+    let out = cli(&stub, dir.path())
+        .args([
+            "attest",
+            "--paths",
+            "only.txt",
+            "--hash-alg",
+            "sha2-256",
+            "--hash-alg",
+            "blake2b-256",
+            "--receipt-out",
+            "r.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "attest co-hash failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let sha = hex::encode(sha256(content));
+    let blake = hex::encode(cardanowall::hash::blake2b256(content));
+
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stdout["item_hashes"]["sha2-256"].as_str().unwrap(), sha);
+    assert_eq!(
+        stdout["item_hashes"]["blake2b-256"].as_str().unwrap(),
+        blake
+    );
+    // The legacy field is the sha2-256 digest, never the blake2b one.
+    assert_eq!(stdout["item_sha2_256"].as_str().unwrap(), sha);
+
+    let receipt = read_json(&dir.path().join("r.json"));
+    let item = &receipt["items"][0];
+    assert_eq!(item["hashes"]["sha2-256"].as_str().unwrap(), sha);
+    assert_eq!(item["hashes"]["blake2b-256"].as_str().unwrap(), blake);
+    assert_eq!(item["sha2_256"].as_str().unwrap(), sha);
+}
+
+/// The default (sha2-256-only) single-item case keeps the legacy `sha2_256` /
+/// `item_sha2_256` field populated — the CI wrappers that parse it must keep
+/// working — and the same digest appears in the hashes map under `sha2-256`.
+#[test]
+fn attest_single_file_default_sha2_keeps_the_legacy_field_and_maps_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let content = b"default sha2 artifact";
+    std::fs::write(dir.path().join("only.txt"), content).unwrap();
+    let stub = StubGateway::start(StubConfig::default());
+    let out = cli(&stub, dir.path())
+        .args([
+            "attest",
+            "--paths",
+            "only.txt",
+            "--receipt-out",
+            "r.json",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "attest default sha2 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let sha = hex::encode(sha256(content));
+    let stdout: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(stdout["item_hashes"]["sha2-256"].as_str().unwrap(), sha);
+    assert_eq!(stdout["item_sha2_256"].as_str().unwrap(), sha);
+    assert!(stdout["item_hashes"]["blake2b-256"].is_null());
+
+    let receipt = read_json(&dir.path().join("r.json"));
+    let item = &receipt["items"][0];
+    assert_eq!(item["hashes"]["sha2-256"].as_str().unwrap(), sha);
+    assert_eq!(item["sha2_256"].as_str().unwrap(), sha);
+}

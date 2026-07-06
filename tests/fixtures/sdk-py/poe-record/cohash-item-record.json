@@ -1,0 +1,9 @@
+{
+  "description": "A single hash-only content item co-hashed under sha2-256 AND blake2b-256. Pins that a two-entry hashes map encodes deterministically — canonical CBOR sorts sha2-256 before blake2b-256 by length-first key order, so the encoded bytes are independent of the input order — and that the digests derive from the content. Cross-SDK byte oracle for the co-hash producer path (the SDK publish_prehashed / seal co-hash helpers build the identical item).",
+  "content_hex": "636f2d68617368206974656d204b41543a206f6e6520636f6e74656e74206974656d20756e64657220736861322d32353620616e6420626c616b6532622d323536",
+  "hashes": {
+    "sha2-256": "9951d9e5b20e02adeebe38072513d2ea2b709265840db9be5c21d408e3c46163",
+    "blake2b-256": "12ab63f16b474fef3afa7c57c21b1f7c9641cbf9acf10f3cb8b52ed4e5084674"
+  },
+  "cbor_hex": "a2617601656974656d7381a166686173686573a268736861322d32353658209951d9e5b20e02adeebe38072513d2ea2b709265840db9be5c21d408e3c461636b626c616b6532622d323536582012ab63f16b474fef3afa7c57c21b1f7c9641cbf9acf10f3cb8b52ed4e5084674"
+}

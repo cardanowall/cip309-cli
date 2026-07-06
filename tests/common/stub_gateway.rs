@@ -129,6 +129,11 @@ pub enum PublishBehavior {
     /// after any uploads already succeeded (scripts the paid-upload error
     /// path).
     Reject,
+    /// Reject the FIRST publish (like [`Reject`](Self::Reject)) then accept every
+    /// later one as a fresh publish. Lets one gateway serve both a failed run and
+    /// its resume, so the resume can target the same URL the resume consistency
+    /// check requires.
+    RejectFirstThenAccept,
 }
 
 /// One scripted SSE frame.
@@ -285,9 +290,17 @@ impl StubGateway {
     }
 }
 
-/// Build the configured publish response (status, body).
-fn publish_response(config: &StubConfig) -> (u16, String) {
-    match config.publish {
+/// Build the configured publish response (status, body). `attempt` is the
+/// 1-based sequence number of this publish, so a reject-then-accept script can
+/// fail the first and accept the rest.
+fn publish_response(config: &StubConfig, attempt: usize) -> (u16, String) {
+    let behavior = match config.publish {
+        PublishBehavior::RejectFirstThenAccept if attempt <= 1 => PublishBehavior::Reject,
+        PublishBehavior::RejectFirstThenAccept => PublishBehavior::Fresh,
+        other => other,
+    };
+    match behavior {
+        PublishBehavior::RejectFirstThenAccept => unreachable!("resolved above"),
         PublishBehavior::Fresh => (
             202,
             format!(
@@ -374,6 +387,14 @@ fn handle_connection(
         );
         write_json(&mut stream, 200, &body);
     } else if request.method == "POST" && request.path.ends_with("/poe/publish") {
+        // The 1-based sequence number of THIS publish (the log already holds it),
+        // so a reject-then-accept script can fail the first and accept the rest.
+        let attempt = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.path.ends_with("/poe/publish"))
+            .count();
         // The real gateway's Idempotency-Key contract: the key binds to a
         // hash of the ENTIRE request body. Same key + same body → replay the
         // stored response verbatim; same key + different body → 409.
@@ -402,7 +423,7 @@ fn handle_connection(
                 }
                 return;
             }
-            let (status, body) = publish_response(config);
+            let (status, body) = publish_response(config, attempt);
             memory.insert(
                 key,
                 StoredPublish {
@@ -415,7 +436,7 @@ fn handle_connection(
             write_json(&mut stream, status, &body);
             return;
         }
-        let (status, body) = publish_response(config);
+        let (status, body) = publish_response(config, attempt);
         write_json(&mut stream, status, &body);
     } else if request.method == "GET" && request.path.contains("/poe/events/") {
         serve_sse(&mut stream, config);

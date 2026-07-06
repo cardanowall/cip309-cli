@@ -25,6 +25,11 @@
 //! its `ar://` URI on-chain; `--publish root` keeps the leaves private and
 //! publishes only `root`/`leaf_count`.
 //!
+//! `--uri <ar://|ipfs://>` attaches an already-pinned content-discovery mirror
+//! to a **single-leaf** `items[]` record (repeatable, the direct analog of
+//! `submit --uri`). It does not apply to a Merkle record (2+ leaves), which
+//! binds its leaves-list URI via `--publish full-tree` instead.
+//!
 //! ## Determinism and re-runs
 //!
 //! The manifest and the Merkle root are pure functions of the selected file
@@ -68,10 +73,11 @@ use sha2::{Digest, Sha256};
 
 use crate::commands::certificate::NetworkArg;
 use crate::commands::publish_common::{
-    arweave_uri_placeholder, content_upload_idempotency_key, encode_record_with_signer,
-    enforce_max_usd, map_client_error, map_upload_error, parse_supersedes, refresh_quote_if_stale,
-    resolve_optional_signer, resolve_required_gateway, wait_for_poe_target, GatewayArgs,
-    WaitOutcome, WaitTargetArg, LEAVES_LIST_UPLOAD_ROLE,
+    arweave_uri_placeholder, cohash_content, content_upload_idempotency_key,
+    encode_record_with_signer, enforce_max_usd, map_client_error, map_upload_error,
+    parse_supersedes, refresh_quote_if_stale, resolve_content_hash_algs, resolve_optional_signer,
+    resolve_required_gateway, validate_content_uris, wait_for_poe_target, ContentHashAlg,
+    GatewayArgs, ItemHashesMap, WaitOutcome, WaitTargetArg, LEAVES_LIST_UPLOAD_ROLE,
 };
 use crate::secret::{SecretArgs, SystemSecretEnv};
 use crate::util::rfc3339::rfc3339_to_epoch_seconds;
@@ -111,6 +117,19 @@ pub struct AttestArgs {
     /// name↔hash binding itself (files mode only).
     #[arg(long = "anchor-manifest")]
     pub anchor_manifest: bool,
+    /// content-discovery URI to attach to a single-leaf items[] record: an
+    /// already-pinned `ar://` / `ipfs://` mirror (repeatable). Applies only to
+    /// a single-leaf record; a Merkle record (2+ leaves) binds its leaves-list
+    /// URI via --publish full-tree.
+    #[arg(long = "uri", value_name = "AR-OR-IPFS-URI")]
+    pub uri: Vec<String>,
+    /// content-hash algorithm for a single-leaf items[] record (repeatable:
+    /// co-hash the lone --paths / --commits source under each, e.g. --hash-alg
+    /// sha2-256 --hash-alg blake2b-256). A Merkle record (2+ leaves) commits
+    /// sha2-256 leaves only. A single --leaf pass-through digest takes exactly
+    /// one --hash-alg, which labels it. Default sha2-256.
+    #[arg(long = "hash-alg", value_name = "ALG")]
+    pub hash_alg: Vec<String>,
     /// where the deterministic manifest is written (files mode).
     #[arg(long = "manifest-out", default_value = "poe-manifest.json")]
     pub manifest_out: String,
@@ -187,6 +206,8 @@ impl std::fmt::Debug for AttestArgs {
             .field("leaves", &self.leaves)
             .field("publish", &self.publish)
             .field("anchor_manifest", &self.anchor_manifest)
+            .field("uri", &self.uri)
+            .field("hash_alg", &self.hash_alg)
             .field("manifest_out", &self.manifest_out)
             .field("seed", &self.seed.as_ref().map(|_| "[redacted]"))
             .field("seed_file", &self.seed_file)
@@ -307,6 +328,14 @@ struct LeafCollection {
     manifest: Option<ManifestOutput>,
     /// The commit shas (git mode only).
     commits: Option<Vec<ReceiptCommit>>,
+    /// The lone `--paths` file, retained when the selection is a single file
+    /// that stays a single-leaf `items[]` record (no `--anchor-manifest`), so a
+    /// `--hash-alg` co-hash can re-hash its bytes without loading them during
+    /// collection.
+    single_source_path: Option<PathBuf>,
+    /// The lone `--commits` commit object bytes, retained when a single commit
+    /// is selected, so a `--hash-alg` co-hash can hash them for the item.
+    single_source_bytes: Option<Vec<u8>>,
 }
 
 /// Pick the leaf source: exactly one of `--paths` / `--commits` / `--leaf`.
@@ -552,6 +581,11 @@ fn collect_path_leaves(args: &AttestArgs) -> Result<LeafCollection, CliError> {
         labels.push(Some(args.manifest_out.clone()));
     }
 
+    // A single file with no anchored manifest stays a one-leaf items[] record,
+    // so retain its path for a possible `--hash-alg` co-hash of the item.
+    let single_source_path =
+        (selected.len() == 1 && !args.anchor_manifest).then(|| selected[0].1.clone());
+
     Ok(LeafCollection {
         source: LeafSource::Paths,
         leaves,
@@ -563,6 +597,8 @@ fn collect_path_leaves(args: &AttestArgs) -> Result<LeafCollection, CliError> {
             anchored: args.anchor_manifest,
         }),
         commits: None,
+        single_source_path,
+        single_source_bytes: None,
     })
 }
 
@@ -624,6 +660,9 @@ fn collect_commit_leaves(range: &str) -> Result<LeafCollection, CliError> {
     let mut leaves = Vec::with_capacity(shas.len());
     let mut labels = Vec::with_capacity(shas.len());
     let mut commits = Vec::with_capacity(shas.len());
+    // A single commit stays a one-leaf items[] record; retain its object bytes
+    // for a possible `--hash-alg` co-hash of the item.
+    let mut single_source_bytes: Option<Vec<u8>> = None;
     for sha in &shas {
         let mut header = String::new();
         reader.read_line(&mut header).map_err(read_err)?;
@@ -653,6 +692,9 @@ fn collect_commit_leaves(range: &str) -> Result<LeafCollection, CliError> {
         reader.read_exact(&mut trailing).map_err(read_err)?;
 
         let digest = sha256(&payload);
+        if shas.len() == 1 {
+            single_source_bytes = Some(payload);
+        }
         leaves.push(digest);
         labels.push(Some(sha.clone()));
         commits.push(ReceiptCommit {
@@ -670,6 +712,8 @@ fn collect_commit_leaves(range: &str) -> Result<LeafCollection, CliError> {
         leaf_alg: Some("sha2-256"),
         manifest: None,
         commits: Some(commits),
+        single_source_path: None,
+        single_source_bytes,
     })
 }
 
@@ -697,6 +741,8 @@ fn collect_literal_leaves(values: &[String]) -> Result<LeafCollection, CliError>
         leaf_alg: None,
         manifest: None,
         commits: None,
+        single_source_path: None,
+        single_source_bytes: None,
     })
 }
 
@@ -715,6 +761,11 @@ struct PublishedRecord {
     root: Option<[u8; 32]>,
     /// The leaves-list `ar://` URI, in full-tree mode.
     ar_uri: Option<String>,
+    /// The single-leaf `items[0]` record's published `hashes` (alg-id →
+    /// digest), retained so the receipt and stdout report each digest under
+    /// the algorithm that produced it. `None` for a Merkle record, which
+    /// carries no `items[]`.
+    item_hashes: Option<Vec<(String, Vec<u8>)>>,
 }
 
 /// Resolve the Idempotency-Key to send, if any.
@@ -734,12 +785,93 @@ fn resolve_idempotency_key(choice: &str) -> Option<String> {
     }
 }
 
-/// Publish the one-leaf shape: a plain `items[]` record carrying the digest.
-/// The record is built and signed FIRST, so the quote prices its exact
+/// Resolve the `--uri` content-discovery mirrors for the record shape the
+/// collected leaves imply.
+///
+/// A single-leaf `items[]` record (the direct analog of `submit`) carries them,
+/// validated against the SAME fetch-set grammar the canonical record validator
+/// enforces (an absolute `ar://` / `ipfs://` URI, no fragment) — so the CLI's
+/// early check and the on-record check can never diverge. An empty list yields
+/// `None` (no `uris` field). A Merkle record (2+ leaves) binds its leaves-list
+/// URI via `--publish full-tree`, so any `--uri` is a hard input error there.
+fn resolve_item_uris(uris: &[String], leaf_count: usize) -> Result<Option<Vec<String>>, CliError> {
+    if leaf_count == 1 {
+        validate_content_uris(uris, "attest")?;
+        Ok((!uris.is_empty()).then(|| uris.to_vec()))
+    } else if uris.is_empty() {
+        Ok(None)
+    } else {
+        Err(CliError::input(
+            "attest: --uri applies only to a single-leaf attest record; a Merkle record binds \
+             its leaves-list URI via --publish full-tree",
+        ))
+    }
+}
+
+/// The item `hashes` for a single-leaf `items[]` record, resolved from the
+/// selected `--hash-alg` set.
+///
+/// A `--leaf` pass-through digest is the output of exactly one algorithm and
+/// carries no source bytes to re-hash, so it takes exactly one `--hash-alg`
+/// (which labels it — fixing a latent mislabel of a non-sha2-256 pass-through
+/// digest). A `--paths` / `--commits` single source co-hashes its bytes under
+/// every algorithm; the common `sha2-256`-only case reuses the primary leaf
+/// (already streamed at collection time) rather than re-reading.
+fn single_leaf_item_hashes(
+    collection: &LeafCollection,
+    hash_algs: &[ContentHashAlg],
+) -> Result<Vec<(String, Vec<u8>)>, CliError> {
+    let leaf = &collection.leaves[0];
+    let sha2_only = hash_algs == [ContentHashAlg::Sha2_256];
+    match collection.source {
+        LeafSource::Leaves => {
+            if hash_algs.len() != 1 {
+                return Err(CliError::input(
+                    "attest: a single --leaf pass-through digest is one algorithm's output; pass \
+                     exactly one --hash-alg to label it",
+                ));
+            }
+            Ok(vec![(hash_algs[0].as_str().to_string(), leaf.to_vec())])
+        }
+        LeafSource::Paths => {
+            if sha2_only {
+                return Ok(vec![("sha2-256".to_string(), leaf.to_vec())]);
+            }
+            let path = collection
+                .single_source_path
+                .as_ref()
+                .expect("a single-file paths collection retains its source path");
+            // Only the co-hash case re-reads the file (the single-leaf shape is
+            // one file); the default sha2-256 path above never loads it.
+            let content = std::fs::read(path).map_err(|e| {
+                CliError::network(format!(
+                    "attest: cannot read {} to co-hash: {e}",
+                    path.display()
+                ))
+            })?;
+            Ok(cohash_content(&content, hash_algs))
+        }
+        LeafSource::Commits => {
+            if sha2_only {
+                return Ok(vec![("sha2-256".to_string(), leaf.to_vec())]);
+            }
+            let bytes = collection
+                .single_source_bytes
+                .as_ref()
+                .expect("a single-commit collection retains its object bytes");
+            Ok(cohash_content(bytes, hash_algs))
+        }
+    }
+}
+
+/// Publish the one-leaf shape: a plain `items[]` record carrying the item's
+/// hashes (one or more co-hash entries) plus any `--uri` content-discovery
+/// mirrors. The record is built and signed FIRST, so the quote prices its exact
 /// canonical length.
 fn publish_single_item(
     poe: &PoeNamespace<'_>,
-    leaf: &[u8; 32],
+    item_hashes: Vec<(String, Vec<u8>)>,
+    uris: Option<Vec<String>>,
     signer: Option<&dyn Signer>,
     args: &AttestArgs,
     max_usd_micros: Option<i128>,
@@ -748,8 +880,8 @@ fn publish_single_item(
     let record = PoeRecord {
         v: 1,
         items: Some(vec![ItemEntry {
-            hashes: vec![("sha2-256".to_string(), leaf.to_vec())],
-            uris: None,
+            hashes: item_hashes.clone(),
+            uris,
             enc: None,
         }]),
         supersedes: supersedes.map(<[u8]>::to_vec),
@@ -780,6 +912,7 @@ fn publish_single_item(
         response,
         root: None,
         ar_uri: None,
+        item_hashes: Some(item_hashes),
     })
 }
 
@@ -884,6 +1017,7 @@ fn publish_merkle_batch(
         response,
         root: Some(root),
         ar_uri,
+        item_hashes: None,
     })
 }
 
@@ -987,7 +1121,13 @@ struct ReceiptQuote {
 
 #[derive(Debug, Serialize)]
 struct ReceiptItem {
-    sha2_256: String,
+    /// The item's digests as the spec's alg→digest map.
+    hashes: ItemHashesMap,
+    /// Legacy convenience field, present ONLY when the item carries a sha2-256
+    /// digest (older receipt consumers read it). It never carries a non-sha2
+    /// digest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha2_256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1064,6 +1204,13 @@ struct AttestOutcome {
     id: String,
     tx_hash: Option<String>,
     status: String,
+    /// The single-item record's digests as the spec's alg→digest map. Absent
+    /// for a Merkle record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_hashes: Option<ItemHashesMap>,
+    /// Legacy convenience field — the sha2-256 digest, present ONLY when the
+    /// item carries a sha2-256 entry (the CI wrappers that parse it). It never
+    /// carries a non-sha2 digest.
     #[serde(skip_serializing_if = "Option::is_none")]
     item_sha2_256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1106,8 +1253,10 @@ fn emit_outcome(outcome: &AttestOutcome, json: bool) {
         "  tx_hash:      {}",
         outcome.tx_hash.as_deref().unwrap_or("<pending>")
     );
-    if let Some(sha) = &outcome.item_sha2_256 {
-        println!("  sha2_256:     {sha}");
+    if let Some(hashes) = &outcome.item_hashes {
+        for (alg, hex) in hashes.entries() {
+            println!("  {alg}: {hex}");
+        }
     }
     if let Some(root) = &outcome.root {
         println!("  root:         {root}");
@@ -1186,6 +1335,7 @@ pub fn run(args: AttestArgs) -> Result<(), CliError> {
         .as_deref()
         .map(|value| parse_supersedes(value, "attest"))
         .transpose()?;
+    let hash_algs = resolve_content_hash_algs(&args.hash_alg, "attest")?;
 
     let gateway = resolve_required_gateway(
         GatewayArgs {
@@ -1214,16 +1364,32 @@ pub fn run(args: AttestArgs) -> Result<(), CliError> {
     .map_err(|e| CliError::input(format!("attest: {e}")))?;
     let poe = client.poe();
 
+    // `--uri` mirrors bind to the single-leaf items[] record only; the decision
+    // (validate + thread, or reject on a Merkle record) is settled up front so
+    // it fires before either publish path.
+    let item_uris = resolve_item_uris(&args.uri, collection.leaves.len())?;
+
     let published = if collection.leaves.len() == 1 {
+        let item_hashes = single_leaf_item_hashes(&collection, &hash_algs)?;
         publish_single_item(
             &poe,
-            &collection.leaves[0],
+            item_hashes,
+            item_uris,
             signer_ref,
             &args,
             max_usd_micros,
             supersedes.as_deref(),
         )?
     } else {
+        // The Merkle registry is rfc9162-sha256 only, so a Merkle commitment's
+        // leaves are always sha2-256; a --hash-alg naming anything else is
+        // refused rather than silently ignored.
+        if hash_algs != [ContentHashAlg::Sha2_256] {
+            return Err(CliError::input(
+                "attest: a Merkle record (2+ leaves) commits sha2-256 leaves only; --hash-alg \
+                 cannot select another algorithm here",
+            ));
+        }
         publish_merkle_batch(
             &poe,
             &collection,
@@ -1301,19 +1467,17 @@ pub fn run(args: AttestArgs) -> Result<(), CliError> {
                 record_hex: bytes_to_hex(&published.record_bytes),
                 signed: signer_pubkey_hex.is_some(),
                 signer_ed25519: signer_pubkey_hex.clone(),
-                items: if published.root.is_none() {
-                    Some(
-                        collection
-                            .leaves
-                            .iter()
-                            .map(|leaf| ReceiptItem {
-                                sha2_256: bytes_to_hex(leaf),
-                            })
-                            .collect(),
-                    )
-                } else {
-                    None
-                },
+                // A single-leaf record's item carries its published `hashes`
+                // map; a Merkle record has no `items[]` (its leaves are the
+                // tree). Reporting the map — not the bare leaf — is what keeps a
+                // non-sha2 or co-hash digest labelled by its own algorithm.
+                items: published.item_hashes.as_ref().map(|hashes| {
+                    let map = ItemHashesMap::from_item_hashes(hashes);
+                    vec![ReceiptItem {
+                        sha2_256: map.sha2_256(),
+                        hashes: map,
+                    }]
+                }),
                 merkle: published.root.map(|root| ReceiptMerkle {
                     root: bytes_to_hex(&root),
                     leaf_count: collection.leaves.len() as u64,
@@ -1369,6 +1533,15 @@ pub fn run(args: AttestArgs) -> Result<(), CliError> {
         })?;
     }
 
+    // Both the map and the legacy field derive from the item's published
+    // `hashes`, so the sha2-256 convenience field can never carry a non-sha2
+    // digest and is simply absent when the item has no sha2-256 entry.
+    let item_hashes = published
+        .item_hashes
+        .as_ref()
+        .map(|hashes| ItemHashesMap::from_item_hashes(hashes));
+    let item_sha2_256 = item_hashes.as_ref().and_then(ItemHashesMap::sha2_256);
+
     let outcome = AttestOutcome {
         mode: collection.source.as_str(),
         record: if published.root.is_some() {
@@ -1379,11 +1552,8 @@ pub fn run(args: AttestArgs) -> Result<(), CliError> {
         id: published.response.id.clone(),
         tx_hash,
         status: status.clone(),
-        item_sha2_256: if published.root.is_none() {
-            Some(bytes_to_hex(&collection.leaves[0]))
-        } else {
-            None
-        },
+        item_hashes,
+        item_sha2_256,
         root: published.root.map(|r| bytes_to_hex(&r)),
         leaf_count: published.root.map(|_| collection.leaves.len() as u64),
         ar_uri: published.ar_uri.clone(),
@@ -1431,6 +1601,8 @@ mod tests {
             leaves: vec![],
             publish: PublishModeArg::FullTree,
             anchor_manifest: false,
+            uri: vec![],
+            hash_alg: vec![],
             manifest_out: "poe-manifest.json".to_string(),
             seed: None,
             seed_file: None,
@@ -1633,6 +1805,95 @@ mod tests {
                 .code,
             4
         );
+    }
+
+    #[test]
+    fn single_leaf_hashes_label_pass_through_and_reject_multi_alg() {
+        let leaf = [0xab; 32];
+        let collection = LeafCollection {
+            source: LeafSource::Leaves,
+            leaves: vec![leaf],
+            labels: vec![None],
+            leaf_alg: None,
+            manifest: None,
+            commits: None,
+            single_source_path: None,
+            single_source_bytes: None,
+        };
+        // A single --hash-alg labels the pass-through digest (no hardcoded sha2-256).
+        assert_eq!(
+            single_leaf_item_hashes(&collection, &[ContentHashAlg::Blake2b256]).unwrap(),
+            vec![("blake2b-256".to_string(), leaf.to_vec())]
+        );
+        // Several algorithms for a lone pass-through digest is refused.
+        assert_eq!(
+            single_leaf_item_hashes(
+                &collection,
+                &[ContentHashAlg::Sha2_256, ContentHashAlg::Blake2b256]
+            )
+            .unwrap_err()
+            .code,
+            4
+        );
+    }
+
+    #[test]
+    fn single_leaf_hashes_cohash_a_byte_backed_source() {
+        let bytes = b"commit object bytes".to_vec();
+        let leaf = sha256(&bytes);
+        let collection = LeafCollection {
+            source: LeafSource::Commits,
+            leaves: vec![leaf],
+            labels: vec![None],
+            leaf_alg: Some("sha2-256"),
+            manifest: None,
+            commits: None,
+            single_source_path: None,
+            single_source_bytes: Some(bytes.clone()),
+        };
+        // sha2-256 alone reuses the primary leaf without re-hashing.
+        assert_eq!(
+            single_leaf_item_hashes(&collection, &[ContentHashAlg::Sha2_256]).unwrap(),
+            vec![("sha2-256".to_string(), leaf.to_vec())]
+        );
+        // Co-hash re-hashes the retained bytes under every algorithm.
+        let algs = [ContentHashAlg::Sha2_256, ContentHashAlg::Blake2b256];
+        let hashes = single_leaf_item_hashes(&collection, &algs).unwrap();
+        assert_eq!(hashes, cohash_content(&bytes, &algs));
+        assert_eq!(hashes.len(), 2);
+    }
+
+    #[test]
+    fn single_leaf_uri_is_validated_threaded_and_defaults_to_none() {
+        let ar = format!("ar://{}", "a".repeat(43));
+        // A single-leaf record carries the validated mirror on its item.
+        assert_eq!(
+            resolve_item_uris(std::slice::from_ref(&ar), 1).unwrap(),
+            Some(vec![ar.clone()])
+        );
+        // No --uri means no `uris` field at all.
+        assert_eq!(resolve_item_uris(&[], 1).unwrap(), None);
+    }
+
+    #[test]
+    fn uri_on_a_merkle_record_is_refused() {
+        let ar = format!("ar://{}", "a".repeat(43));
+        // 2+ leaves publish a Merkle record, which binds its leaves-list URI via
+        // --publish full-tree; a --uri item mirror has no meaning there.
+        let err = resolve_item_uris(std::slice::from_ref(&ar), 2).unwrap_err();
+        assert_eq!(err.code, 4);
+        assert!(err.message.contains("single-leaf"), "{}", err.message);
+        // An empty --uri list on a Merkle record is fine (nothing to bind).
+        assert_eq!(resolve_item_uris(&[], 3).unwrap(), None);
+    }
+
+    #[test]
+    fn single_leaf_uri_rejects_a_malformed_mirror() {
+        // Reuses submit's fetch-set grammar: a fragment (and a too-short txid)
+        // is rejected before any network call.
+        let err = resolve_item_uris(&["ar://bad#fragment".to_string()], 1).unwrap_err();
+        assert_eq!(err.code, 4);
+        assert!(err.message.contains("ar:// or ipfs://"), "{}", err.message);
     }
 
     #[test]
