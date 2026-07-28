@@ -528,8 +528,7 @@ fn publish_stored_file(
         items: vec![ItemShape {
             hash_algs: hashes.iter().map(|(alg, _)| alg.clone()).collect(),
             uris: shape_uris,
-            recipient_count: 0,
-            kem: None,
+            enc: None,
         }],
         signed: inputs.signer.is_some(),
         supersedes: inputs.supersedes.is_some(),

@@ -71,7 +71,7 @@ use cardanowall::client::{
     SubmitPassphraseSealedInput, SubmitSealedError, SubmitSealedInput, SupportedHashAlg,
     UploadReceipt,
 };
-use cardanowall::estimate::{ItemShape, RecordShape, MAX_RECORD_BYTES};
+use cardanowall::estimate::{EncShape, ItemShape, RecordShape, MAX_RECORD_BYTES};
 use cardanowall::recipient::{parse_age_recipient, RecipientKem};
 use cardanowall::sealed_poe::SealedKem;
 use cardanowall::seed_derive::{
@@ -491,8 +491,10 @@ fn enforce_capacity(
             .map(|alg| alg.as_str().to_string())
             .collect(),
         uris: vec![arweave_uri_placeholder()],
-        recipient_count: recipients.keys.len() as u64,
-        kem: Some(recipients.sealed_kem()),
+        enc: Some(EncShape::Kem {
+            kem: recipients.sealed_kem(),
+            recipient_count: recipients.keys.len() as u64,
+        }),
     };
     let shape = RecordShape {
         items: vec![item; item_count],

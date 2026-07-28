@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 > Pre-1.0 versions do not carry the stability guarantees of
 > [Semantic Versioning](https://semver.org/).
 
+## [0.12.0] - 2026-07-28
+
+Built and tested against the `cardanowall` SDK 0.12.0.
+
+### Changed
+
+- Rebuilt against SDK 0.12.0, which adds streaming passphrase sealing and opening and moves the size estimator to explicit envelope shapes. The command surface, flags, and output are unchanged.
+
 ## [0.11.0] - 2026-07-06
 
 Built and tested against the `cardanowall` SDK 0.11.0.
